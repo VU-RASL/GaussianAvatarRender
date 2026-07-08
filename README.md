@@ -1,13 +1,14 @@
-# Gaussian Avatar Render
+# Depth-consistent rendering of animatable Gaussian avatars in Unity/OpenXR for Meta Quest 3 passthrough AR.
 
-Depth-consistent rendering of animatable Gaussian avatars in Unity/OpenXR for Meta Quest 3 passthrough AR.
 
-This repository contains the Unity project used for the accepted paper:
 
-> **[PLACEHOLDER: Paper title]**  
-> [PLACEHOLDER: Authors]  
-> [PLACEHOLDER: Conference / venue / year]  
-> [PLACEHOLDER: DOI, arXiv, project page, or citation link]
+This repository contains official implementation of the accepted paper:
+
+> **Depth-consistent rendering of animatable Gaussian avatars in Unity/OpenXR for Meta Quest 3 passthrough AR.
+**  
+> Rendong Zhang ;  Alexandra Watkins ; Nilanjan Sarkar 
+> ICVR 2026 
+
 
 The project demonstrates a practical rendering pipeline for placing an animatable 3D Gaussian avatar into Quest 3 AR while preserving correct ordering with ordinary Unity objects, such as an opaque sphere. The goal is to let a Gaussian avatar behave like a spatial AR character rather than a flat composited overlay.
 
