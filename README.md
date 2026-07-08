@@ -10,6 +10,8 @@ This repository contains official implementation of the accepted paper:
 >
 > ICVR 2026 
 
+![Method overview](docs/images/method_overview.png)
+
 
 The project demonstrates a practical rendering pipeline for placing an animatable 3D Gaussian avatar into Quest 3 AR while preserving correct ordering with ordinary Unity objects, such as an opaque sphere. The goal is to let a Gaussian avatar behave like a spatial AR character rather than a flat composited overlay.
 
