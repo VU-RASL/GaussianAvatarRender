@@ -48,14 +48,8 @@ ExportedObj/
 *.opendb
 *.VC.db
 
-# Unity3D generated meta files
-*.meta
-!Assets/Scripts/GeneralOperator.cs.meta
-!Assets/Scripts/ARGroundPlacement.cs.meta
-!Assets/Scripts/ARPoseControlPanel.cs.meta
-!Assets/Scripts/GrabbableTestBall.cs.meta
-!Assets/XR/XRGeneralSettingsPerBuildTarget.asset.meta
-!Assets/XR/Loaders/OpenXRLoader.asset.meta
+# Unity metadata files are required for stable Unity GUIDs.
+# Do not ignore *.meta in this repository.
 *.pidb.meta
 *.pdb.meta
 *.mdb.meta
