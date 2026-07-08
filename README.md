@@ -4,8 +4,7 @@
 
 This repository contains official implementation of the accepted paper:
 
-> **Depth-consistent rendering of animatable Gaussian avatars in Unity/OpenXR for Meta Quest 3 passthrough AR.
-**  
+> Depth-consistent rendering of animatable Gaussian avatars in Unity/OpenXR for Meta Quest 3 passthrough AR
 > Rendong Zhang ;  Alexandra Watkins ; Nilanjan Sarkar 
 > ICVR 2026 
 
