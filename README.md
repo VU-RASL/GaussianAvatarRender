@@ -183,11 +183,8 @@ If you use this project in academic work, please cite:
 
 ## Acknowledgements
 
-This project builds on the Unity Gaussian Splatting package by Aras Pranckevicius and integrates Unity, OpenXR, Meta XR, AR Foundation, SMPL-X-based animation control, and custom Quest 3 rendering changes for AR Gaussian avatar deployment.
+This project builds on the Unity Gaussian Splatting package by Aras Pranckevicius and integrates Unity, OpenXR, Meta XR, AR Foundation, SMPL-X-based animation control, GSAC, and custom Quest 3 rendering changes for AR Gaussian avatar deployment.
 
-[PLACEHOLDER: Add funding, lab, collaborator, dataset, avatar asset, and institutional acknowledgements.]
-
-## License
 
 [PLACEHOLDER: Add project license.]
 
