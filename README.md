@@ -166,13 +166,12 @@ Packages/UnityGaussianSplatting/
 If you use this project in academic work, please cite:
 
 ```bibtex
-@inproceedings{PLACEHOLDER_GaussianAvatarRender,
-  title     = {[PLACEHOLDER: Paper title]},
-  author    = {[PLACEHOLDER: Authors]},
-  booktitle = {[PLACEHOLDER: Conference / venue]},
-  year      = {[PLACEHOLDER: Year]},
-  doi       = {[PLACEHOLDER: DOI]},
-  url       = {[PLACEHOLDER: URL]}
+@inproceedings{zhang2026depthconsistent,
+  title     = {Depth-Consistent Rendering of Animatable Gaussian Avatars in Standalone Augmented Reality},
+  author    = {Zhang, Rendong and Watkins, Alexandra and Sarkar, Nilanjan},
+  booktitle = {Proceedings of the International Conference on Virtual Reality (ICVR)},
+  year      = {2026},
+  note      = {Accepted, to appear}
 }
 ```
 
