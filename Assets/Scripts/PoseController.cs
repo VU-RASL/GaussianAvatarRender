@@ -1,4 +1,5 @@
 using UnityEngine;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using Unity.Mathematics;
@@ -73,6 +74,8 @@ public class PoseController : MonoBehaviour
 
     public bool NoPose => no_pose;
     public bool APose => a_pose;
+    public event Action<PoseController> BeforeVertexBake;
+    bool vertexBakeRequested;
 
     void Reset()
     {
@@ -310,11 +313,18 @@ public class PoseController : MonoBehaviour
         }
 
         if (ShouldBakeVerticesThisFrame())
+        {
+            BeforeVertexBake?.Invoke(this);
             UpdateVertexBuffer();
+            vertexBakeRequested = false;
+        }
     }
 
     bool ShouldBakeVerticesThisFrame()
     {
+        if (vertexBakeRequested)
+            return true;
+
 #if UNITY_ANDROID && !UNITY_EDITOR
         if (currentVertices == null || currentVertices.Length == 0)
             return true;
@@ -324,6 +334,16 @@ public class PoseController : MonoBehaviour
 #else
         return true;
 #endif
+    }
+
+    public void RequestImmediateBake()
+    {
+        vertexBakeRequested = true;
+    }
+
+    public void RequestImmediateVertexBake()
+    {
+        RequestImmediateBake();
     }
     void InitializeJoints()
     {

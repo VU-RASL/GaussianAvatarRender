@@ -284,19 +284,25 @@ void SaveHahaScalingToTxt()
     }
     void Update()
     {
-        if (UseQuestCpuSplatUpdate)
-            return;
-
-        vertexBuffer = poseController.GetVertexBuffer();
-        testShader.SetBuffer(calcFacesKernelHandle, "VertexBuffer", vertexBuffer);
-
-        ExecuteShader();
     }
 
     void LateUpdate()
     {
         if (UseQuestCpuSplatUpdate && ShouldRunQuestCpuUpdateThisFrame())
+        {
             ExecuteQuestCpuUpdate();
+            return;
+        }
+
+        if (UseQuestCpuSplatUpdate || !isInitialized || poseController == null || testShader == null)
+            return;
+
+        vertexBuffer = poseController.GetVertexBuffer();
+        if (vertexBuffer == null)
+            return;
+
+        testShader.SetBuffer(calcFacesKernelHandle, "VertexBuffer", vertexBuffer);
+        ExecuteShader();
     }
 
     bool ShouldRunQuestCpuUpdateThisFrame()
