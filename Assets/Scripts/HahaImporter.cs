@@ -20,6 +20,7 @@ public class HahaImporter : MonoBehaviour
     [SerializeField, HideInInspector] bool saveTextureToFile = false;
     [SerializeField, HideInInspector] string gaussianToFaceSavePath = "Assets/HahaData/GaussianToFace.txt";
     [SerializeField, HideInInspector] string colorsSavePath = "Assets/HahaData/Colors.txt";
+    [SerializeField, HideInInspector] TextAsset bundledStateDict;
 
     [NonSerialized]
     public HahaAvatarData data;
@@ -51,10 +52,11 @@ public class HahaImporter : MonoBehaviour
     {
         string fullPath = Path.GetFullPath(GetJsonPath());
         string resourcePath = GetResourcePath();
-        string loadKey = GetDataCacheKey(fullPath, resourcePath);
+        TextAsset bundledData = GetMatchingBundledStateDict(fullPath);
+        string loadKey = GetDataCacheKey(fullPath, resourcePath, bundledData);
         if (data == null || loadedFullPath != loadKey)
         {
-            data = GetOrLoadData(fullPath, resourcePath);
+            data = GetOrLoadData(fullPath, resourcePath, bundledData);
             loadedFullPath = loadKey;
             buffersInitialized = false;
         }
@@ -89,7 +91,15 @@ public class HahaImporter : MonoBehaviour
         return $"{resourcesFolder}/{filePrefix}{cleanObjectName}";
     }
 
-    static string GetDataCacheKey(string fullPath, string resourcePath)
+    TextAsset GetMatchingBundledStateDict(string fullPath)
+    {
+        return bundledStateDict != null &&
+               string.Equals(bundledStateDict.name, Path.GetFileNameWithoutExtension(fullPath), StringComparison.Ordinal)
+            ? bundledStateDict
+            : null;
+    }
+
+    static string GetDataCacheKey(string fullPath, string resourcePath, TextAsset bundledData = null)
     {
 #if UNITY_EDITOR
         if (File.Exists(fullPath))
@@ -97,12 +107,16 @@ public class HahaImporter : MonoBehaviour
             return fullPath;
         }
 #endif
+        if (bundledData != null)
+        {
+            return $"bundled://{bundledData.GetInstanceID()}/{resourcePath}";
+        }
         return $"resources://{resourcePath}";
     }
 
-    static HahaAvatarData GetOrLoadData(string fullPath, string resourcePath)
+    static HahaAvatarData GetOrLoadData(string fullPath, string resourcePath, TextAsset bundledData = null)
     {
-        string cacheKey = GetDataCacheKey(fullPath, resourcePath);
+        string cacheKey = GetDataCacheKey(fullPath, resourcePath, bundledData);
         if (s_DataCache.TryGetValue(cacheKey, out HahaAvatarData cachedData))
         {
             return cachedData;
@@ -110,7 +124,7 @@ public class HahaImporter : MonoBehaviour
 
         try
         {
-            string jsonContent = LoadJsonContent(fullPath, resourcePath);
+            string jsonContent = LoadJsonContent(fullPath, resourcePath, bundledData);
             if (string.IsNullOrEmpty(jsonContent))
             {
                 return null;
@@ -127,7 +141,7 @@ public class HahaImporter : MonoBehaviour
         }
     }
 
-    static string LoadJsonContent(string fullPath, string resourcePath)
+    static string LoadJsonContent(string fullPath, string resourcePath, TextAsset bundledData = null)
     {
 #if UNITY_EDITOR
         if (File.Exists(fullPath))
@@ -135,6 +149,11 @@ public class HahaImporter : MonoBehaviour
             return File.ReadAllText(fullPath);
         }
 #endif
+
+        if (bundledData != null)
+        {
+            return bundledData.text;
+        }
 
         TextAsset resource = Resources.Load<TextAsset>(resourcePath);
         if (resource != null)

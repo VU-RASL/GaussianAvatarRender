@@ -1,54 +1,91 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
-using System.Reflection;
+using Meta.XR.EnvironmentDepth;
+using Unity.XR.CoreUtils;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using UnityEngine.XR;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
 using UnityEngine.XR.Management;
 
+[DefaultExecutionOrder(-9000)]
 public sealed class QuestARBootstrap : MonoBehaviour
 {
-    static readonly string[] s_DefaultObjectsToHide =
-    {
-        "Sphere",
-        "Plane",
-        "Plane (1)",
-        "Cube",
-    };
+    static readonly string[] s_DefaultObjectsToHide = { "Sphere", "Plane", "Plane (1)", "Cube" };
     static readonly HashSet<string> s_WarnedMissingTypes = new();
+    static readonly int s_DepthBiasId = Shader.PropertyToID("_GsacEnvironmentDepthBias");
     static bool s_XRSubsystemsStarted;
-    const bool kEnableRealWorldEnvironmentOcclusion = false;
+    static bool s_ScenePermissionRequested;
+
+    readonly List<MaterialReplacement> materialReplacements = new();
+    readonly HashSet<Renderer> replacedRenderers = new();
+    Coroutine setupRoutine;
+    Coroutine depthStartRoutine;
+    bool sceneSetupInProgress;
+    bool sceneSetupComplete;
+    GameObject depthRuntimeRoot;
+    OVRCameraRig depthCameraRig;
+    OVRManager ovrManager;
+    EnvironmentDepthManager depthManager;
+    Transform trackingSpaceSource;
+    bool useOculusProfile;
+    bool depthRequested;
+    bool previousDepthAvailable;
+    bool reportedDepthTimeout;
+    bool isARMode;
+    bool floorOriginApplied;
+    bool applicationPaused;
+    bool applicationFocused = true;
+    bool ownsEyeAlphaMode;
+    bool previousEyeAlphaMode;
+    float depthStartedAt;
     float nextCameraConfigureTime;
+
+    sealed class MaterialReplacement
+    {
+        public Renderer renderer;
+        public Material[] originals;
+        public Material[] instances;
+    }
+
+    public bool EnvironmentDepthEnabled => depthRequested;
+    public bool EnvironmentDepthAvailable => CanUseDepthNow && depthManager != null && depthManager.IsDepthAvailable;
+    bool CanUseDepthNow => isARMode && useOculusProfile && depthRequested &&
+                           !applicationPaused && applicationFocused;
+
+    // Inspect the selected loader before XR startup as well, so scene Awake cannot
+    // briefly start ARFoundation managers in an Oculus depth build.
+    public static bool IsOculusLoaderConfigured()
+    {
+        XRManagerSettings manager = XRGeneralSettings.Instance?.Manager;
+        if (manager == null)
+            return false;
+        if (manager.activeLoader != null)
+            return manager.activeLoader.GetType().FullName == "Unity.XR.Oculus.OculusLoader";
+        var loaders = manager.activeLoaders;
+        return loaders.Count > 0 && loaders[0] != null &&
+               loaders[0].GetType().FullName == "Unity.XR.Oculus.OculusLoader";
+    }
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Bootstrap()
     {
 #if UNITY_ANDROID && !UNITY_EDITOR
-        if (GeneralOperator.GetSceneMode() != GeneralBuildMode.AR)
+        if (GeneralOperator.GetSceneMode() != GeneralBuildMode.AR ||
+            FindObjectOfType<QuestARBootstrap>() != null)
             return;
-
-        if (FindObjectOfType<QuestARBootstrap>() != null)
-            return;
-
-        var go = new GameObject("Quest AR Bootstrap");
-        DontDestroyOnLoad(go);
-        go.AddComponent<QuestARBootstrap>();
+        var root = new GameObject("Quest AR Bootstrap");
+        DontDestroyOnLoad(root);
+        root.AddComponent<QuestARBootstrap>();
 #endif
     }
 
     void Start()
     {
 #if UNITY_ANDROID && !UNITY_EDITOR
-        if (GeneralOperator.GetSceneMode() != GeneralBuildMode.AR)
-        {
-            Destroy(gameObject);
-            return;
-        }
-
-        ConfigureAR();
-        StartCoroutine(StartXRThenRestartARManagers());
+        QueueSceneSetup();
 #endif
     }
 
@@ -56,6 +93,7 @@ public sealed class QuestARBootstrap : MonoBehaviour
     {
 #if UNITY_ANDROID && !UNITY_EDITOR
         SceneManager.sceneLoaded += OnSceneLoaded;
+        ConfigureEyeAlphaMode();
 #endif
     }
 
@@ -64,51 +102,159 @@ public sealed class QuestARBootstrap : MonoBehaviour
 #if UNITY_ANDROID && !UNITY_EDITOR
         SceneManager.sceneLoaded -= OnSceneLoaded;
 #endif
+        ReleaseDepthManager();
+        RestoreEyeAlphaMode();
+    }
+
+    void OnDestroy()
+    {
+        RestoreEyeAlphaMode();
+        RestoreOrdinaryMaterials();
+    }
+
+    void OnApplicationPause(bool paused)
+    {
+        applicationPaused = paused;
+        if (!paused && applicationFocused)
+            ConfigureEyeAlphaMode();
+        if (!TryResumeSceneSetup())
+            RefreshDepthLifecycle();
+    }
+
+    void OnApplicationFocus(bool focused)
+    {
+        applicationFocused = focused;
+        if (focused && !applicationPaused)
+            ConfigureEyeAlphaMode();
+        if (!TryResumeSceneSetup())
+            RefreshDepthLifecycle();
     }
 
     void OnSceneLoaded(Scene scene, LoadSceneMode mode)
     {
 #if UNITY_ANDROID && !UNITY_EDITOR
-        if (GeneralOperator.GetSceneMode() == GeneralBuildMode.AR)
-        {
-            ConfigureAR();
-            StartCoroutine(StartXRThenRestartARManagers());
-        }
+        QueueSceneSetup();
 #endif
     }
 
-    void LateUpdate()
+    bool TryResumeSceneSetup()
     {
-#if UNITY_ANDROID && !UNITY_EDITOR
-        if (GeneralOperator.GetSceneMode() == GeneralBuildMode.AR && Time.unscaledTime >= nextCameraConfigureTime)
-        {
-            nextCameraConfigureTime = Time.unscaledTime + 1.0f;
-            ConfigureCameras();
-        }
-#endif
+        if (!isActiveAndEnabled || applicationPaused || !applicationFocused ||
+            !isARMode || !useOculusProfile || sceneSetupInProgress)
+            return false;
+        if (sceneSetupComplete && depthRuntimeRoot != null && depthCameraRig != null && trackingSpaceSource != null)
+            return false;
+        // A delayed XR startup may have timed out before the passthrough rig
+        // existed. Retry the whole setup on resume, keeping the A/B selection.
+        QueueSceneSetup(true);
+        return true;
     }
 
-    void ConfigureAR()
+    void QueueSceneSetup(bool preserveDepthRequest = false)
     {
-        EnsureComponent("UnityEngine.XR.ARFoundation.ARSession, Unity.XR.ARFoundation", null);
+        if (setupRoutine != null)
+            StopCoroutine(setupRoutine);
+        sceneSetupInProgress = true;
+        sceneSetupComplete = false;
+        var routine = StartCoroutine(ConfigureScene(preserveDepthRequest));
+        // An immediate early exit can run before StartCoroutine returns.
+        setupRoutine = sceneSetupInProgress ? routine : null;
+    }
+
+    void FinishSceneSetup(bool completed)
+    {
+        sceneSetupComplete = completed;
+        sceneSetupInProgress = false;
+        setupRoutine = null;
+    }
+
+    IEnumerator ConfigureScene(bool preserveDepthRequest)
+    {
+        ReleaseDepthManager();
+        RestoreOrdinaryMaterials();
+        isARMode = GeneralOperator.GetSceneMode() == GeneralBuildMode.AR;
+        if (!isARMode)
+        {
+            RestoreEyeAlphaMode();
+            SetEnvironmentDepthEnabled(false);
+            if (depthRuntimeRoot != null)
+                depthRuntimeRoot.SetActive(false);
+            FinishSceneSetup(false);
+            yield break;
+        }
+
+        useOculusProfile = IsOculusLoaderConfigured();
+        if (!useOculusProfile)
+            RestoreEyeAlphaMode();
+        depthRequested = useOculusProfile && (preserveDepthRequest
+            ? depthRequested : GeneralOperator.GetSceneEnvironmentDepthEnabled());
+        Shader.SetGlobalFloat(s_DepthBiasId, 0.0f);
+        if (useOculusProfile)
+            DisableARFoundationManagers();
+        else
+            EnsureComponent("UnityEngine.XR.ARFoundation.ARSession, Unity.XR.ARFoundation", null);
         ConfigureCameras();
-        if (kEnableRealWorldEnvironmentOcclusion)
+        HideTestEnvironment();
+
+        yield return EnsureXRLoaderStarted();
+        XRLoader loader = XRGeneralSettings.Instance?.Manager?.activeLoader;
+        if (loader == null)
         {
-            ConfigureMetaDepthApi();
+            FinishSceneSetup(false);
+            yield break;
+        }
+
+        if (useOculusProfile)
+        {
+            if (!IsOculusLoaderConfigured())
+            {
+                Debug.LogError("GSAC depth profile requires Oculus XR 4.2. No environment depth was started.");
+                FinishSceneSetup(false);
+                yield break;
+            }
+            var display = loader.GetLoadedSubsystem<XRDisplaySubsystem>();
+            for (int frame = 0; frame < 180 && (display == null || !display.running); ++frame)
+            {
+                yield return null;
+                display = loader.GetLoadedSubsystem<XRDisplaySubsystem>();
+            }
+            if (display == null || !display.running)
+            {
+                Debug.LogError("GSAC depth could not start: the XR display is not running.");
+                FinishSceneSetup(false);
+                yield break;
+            }
+
+            ConfigureOculusPassthroughAndRig();
+            yield return null;
+            ConfigureEyeAlphaMode();
+            if (depthCameraRig == null || trackingSpaceSource == null)
+            {
+                FinishSceneSetup(false);
+                yield break;
+            }
+            SyncTrackingSpace();
+
             ApplyDepthOcclusionShaderToOrdinaryObjects();
+            RefreshDepthLifecycle();
+            Debug.Log("GSAC Oculus passthrough profile configured. Environment depth requested=" + depthRequested +
+          (depthRequested ? "; waiting for SDK depth frames." : "; depth acquisition is disabled.") +
+          " Soft occlusion and hand inclusion are configured when depth is requested. " +
+          "Ground placement uses XR floor height rather than detected AR planes.");
         }
         else
         {
             DisableEnvironmentOcclusionManagers();
+            RestartEnabledBehaviours(typeof(ARSession));
+            RestartEnabledBehaviours(typeof(ARCameraManager));
+            RestartEnabledBehaviours(typeof(ARCameraBackground));
+            RestartEnabledBehaviours(typeof(ARPlaneManager));
+            RestartEnabledBehaviours(typeof(ARRaycastManager));
+            Debug.Log("Quest AR OpenXR passthrough baseline configured; environment depth is disabled.");
         }
-        HideTestEnvironment();
-    }
 
-    IEnumerator StartXRThenRestartARManagers()
-    {
-        yield return null;
-        yield return EnsureXRLoaderStarted();
-        yield return RestartARManagersWhenXRLoaderIsReady();
+        RestartEnabledBehaviours(typeof(ARGroundPlacement));
+        FinishSceneSetup(true);
     }
 
     IEnumerator EnsureXRLoaderStarted()
@@ -119,16 +265,13 @@ public sealed class QuestARBootstrap : MonoBehaviour
             Debug.LogError("Quest AR could not find XR Manager Settings.");
             yield break;
         }
-
         if (manager.activeLoader == null)
             yield return manager.InitializeLoader();
-
         if (manager.activeLoader == null)
         {
-            Debug.LogError("Quest AR could not initialize an XR loader. Check XR Plug-in Management > Android > OpenXR.");
+            Debug.LogError("Quest AR could not initialize the selected Android XR loader.");
             yield break;
         }
-
         if (!s_XRSubsystemsStarted)
         {
             manager.StartSubsystems();
@@ -136,30 +279,250 @@ public sealed class QuestARBootstrap : MonoBehaviour
         }
     }
 
-    IEnumerator RestartARManagersWhenXRLoaderIsReady()
+    void ConfigureOculusPassthroughAndRig()
     {
-        for (int frame = 0; frame < 120; ++frame)
+        var origin = FindObjectOfType<XROrigin>(true);
+        trackingSpaceSource = origin != null && origin.CameraFloorOffsetObject != null
+            ? origin.CameraFloorOffsetObject.transform
+            : origin != null ? origin.transform : null;
+        if (trackingSpaceSource == null)
         {
-            if (XRGeneralSettings.Instance?.Manager?.activeLoader != null)
-                break;
-
-            yield return null;
+            Debug.LogError("GSAC depth could not find the XR Origin tracking space. Depth was not enabled.");
+            return;
         }
 
-        ConfigureAR();
-        RestartEnabledBehaviours("UnityEngine.XR.ARFoundation.ARSession, Unity.XR.ARFoundation");
-        RestartEnabledBehaviours("UnityEngine.XR.ARFoundation.ARCameraManager, Unity.XR.ARFoundation");
-        RestartEnabledBehaviours("UnityEngine.XR.ARFoundation.ARCameraBackground, Unity.XR.ARFoundation");
-        if (kEnableRealWorldEnvironmentOcclusion)
-            RestartEnabledBehaviours("UnityEngine.XR.ARFoundation.AROcclusionManager, Unity.XR.ARFoundation");
-        else
-            DisableEnvironmentOcclusionManagers();
-        RestartEnabledBehaviours("UnityEngine.XR.ARFoundation.ARPlaneManager, Unity.XR.ARFoundation");
-        RestartEnabledBehaviours("UnityEngine.XR.ARFoundation.ARRaycastManager, Unity.XR.ARFoundation");
-        RestartEnabledBehaviours(typeof(ARGroundPlacement));
-        Debug.Log("Quest AR passthrough components configured.");
-        if (kEnableRealWorldEnvironmentOcclusion)
-            StartCoroutine(ReportOcclusionStatus());
+        if (depthRuntimeRoot == null)
+        {
+            depthRuntimeRoot = new GameObject("Quest Meta Depth Runtime");
+            depthRuntimeRoot.SetActive(false);
+            depthRuntimeRoot.transform.SetParent(transform, false);
+        }
+
+        ovrManager = FindObjectOfType<OVRManager>(true);
+        if (ovrManager == null)
+            ovrManager = depthRuntimeRoot.AddComponent<OVRManager>();
+        ovrManager.isInsightPassthroughEnabled = true;
+        // Keep the existing single-sample Gaussian target and original quality.
+        // The SDK default otherwise raises MSAA to 4 and breaks depth attachment compatibility.
+        ovrManager.useRecommendedMSAALevel = false;
+        floorOriginApplied = false;
+
+        var passthrough = FindObjectOfType<OVRPassthroughLayer>(true);
+        if (passthrough == null)
+            passthrough = depthRuntimeRoot.AddComponent<OVRPassthroughLayer>();
+        passthrough.overlayType = OVROverlay.OverlayType.Underlay;
+        passthrough.enabled = true;
+
+        depthCameraRig = FindObjectOfType<OVRCameraRig>(true);
+        if (depthCameraRig == null)
+            depthCameraRig = depthRuntimeRoot.AddComponent<OVRCameraRig>();
+        depthCameraRig.disableEyeAnchorCameras = true;
+        depthRuntimeRoot.SetActive(true);
+        depthCameraRig.EnsureGameObjectIntegrity();
+        foreach (var rigCamera in depthCameraRig.GetComponentsInChildren<Camera>(true))
+        {
+            rigCamera.enabled = false;
+            rigCamera.tag = "Untagged";
+        }
+        SyncTrackingSpace();
+    }
+
+    void ConfigureEyeAlphaMode()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (!isActiveAndEnabled || !isARMode || !useOculusProfile ||
+            depthRuntimeRoot == null || !depthRuntimeRoot.activeInHierarchy ||
+            !OVRManager.OVRManagerinitialized)
+            return;
+
+        // Our eye buffer contains premultiplied transparency from both ordinary
+        // soft-occluded objects and the Gaussian composite. The compositor must
+        // not multiply it by alpha a second time when blending over passthrough.
+        // This is an eye-layer setting, independent of OVROverlay texture flags.
+        bool before = OVRManager.eyeFovPremultipliedAlphaModeEnabled;
+        if (ownsEyeAlphaMode && before)
+            return;
+        if (!ownsEyeAlphaMode)
+        {
+            previousEyeAlphaMode = before;
+            ownsEyeAlphaMode = true;
+        }
+        OVRManager.eyeFovPremultipliedAlphaModeEnabled = true;
+        bool after = OVRManager.eyeFovPremultipliedAlphaModeEnabled;
+        Debug.Log("GSAC Oculus eye alpha mode: reported before=" + before +
+            ", requested premultiplied=true, reported after=" + after +
+            ", OVRPlugin=" + OVRPlugin.version + ".");
+        if (!after)
+            Debug.LogWarning("GSAC Oculus compositor did not report premultiplied eye alpha; soft occlusion edges need verification.");
+#endif
+    }
+
+    void RestoreEyeAlphaMode()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (!ownsEyeAlphaMode)
+            return;
+        OVRManager.eyeFovPremultipliedAlphaModeEnabled = previousEyeAlphaMode;
+        Debug.Log("GSAC Oculus eye alpha mode restored: requested=" + previousEyeAlphaMode +
+            ", reported=" + OVRManager.eyeFovPremultipliedAlphaModeEnabled + ".");
+        ownsEyeAlphaMode = false;
+#endif
+    }
+
+    // Called before SDK67's default-order Update. Cached references avoid scene
+    // searches or allocations during the per-frame tracking-space correction.
+    void Update()
+    {
+        if (useOculusProfile)
+        {
+            // SDK67 ignores trackingOriginType assignments before an HMD is
+            // present. Apply it after initialization, then leave tracking alone.
+            if (!floorOriginApplied && ovrManager != null && OVRManager.isHmdPresent)
+            {
+                ovrManager.trackingOriginType = OVRManager.TrackingOrigin.FloorLevel;
+                floorOriginApplied = ovrManager.trackingOriginType == OVRManager.TrackingOrigin.FloorLevel;
+            }
+            SyncTrackingSpace();
+        }
+    }
+
+    void SyncTrackingSpace()
+    {
+        if (trackingSpaceSource == null || depthCameraRig == null || depthCameraRig.trackingSpace == null)
+            return;
+        Transform target = depthCameraRig.trackingSpace;
+        target.SetPositionAndRotation(trackingSpaceSource.position, trackingSpaceSource.rotation);
+        target.localScale = trackingSpaceSource.lossyScale;
+    }
+
+    void LateUpdate()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (!isARMode)
+            return;
+        if (!useOculusProfile)
+        {
+            if (Time.unscaledTime >= nextCameraConfigureTime)
+            {
+                nextCameraConfigureTime = Time.unscaledTime + 1.0f;
+                ConfigureCameras();
+            }
+            return;
+        }
+        if (depthManager == null || !depthRequested)
+            return;
+        bool available = depthManager.IsDepthAvailable;
+        if (available != previousDepthAvailable)
+        {
+            previousDepthAvailable = available;
+            Debug.Log(available
+                ? "GSAC environment depth is receiving frames. Real-world occlusion is active."
+                : "GSAC environment depth frames are temporarily unavailable.");
+        }
+        else if (!available && !reportedDepthTimeout && Time.unscaledTime - depthStartedAt > 15.0f)
+        {
+            reportedDepthTimeout = true;
+            Debug.LogWarning("GSAC depth has not received a frame. Check spatial-data permission, headset support and runtime logs; real-world occlusion is not verified.");
+        }
+#endif
+    }
+
+    // A/B comparison keeps the same XR loader, passthrough, avatar and materials.
+    // Disabling the SDK manager also stops requesting depth textures.
+    public void SetEnvironmentDepthEnabled(bool enabled)
+    {
+        depthRequested = useOculusProfile && enabled;
+        if (!TryResumeSceneSetup())
+            RefreshDepthLifecycle();
+        Debug.Log(depthRequested ? "GSAC environment depth enabled." : "GSAC environment depth disabled for A/B comparison.");
+    }
+
+    void RefreshDepthLifecycle()
+    {
+        if (!CanUseDepthNow || !isActiveAndEnabled)
+        {
+            ReleaseDepthManager();
+            return;
+        }
+        if (depthManager == null && depthStartRoutine == null && depthRuntimeRoot != null &&
+            depthRuntimeRoot.activeInHierarchy && depthCameraRig != null && trackingSpaceSource != null)
+            depthStartRoutine = StartCoroutine(CreateDepthManagerWhenReady());
+    }
+
+    IEnumerator CreateDepthManagerWhenReady()
+    {
+        // SDK67 retains _prevTextureId after disable. Recreate our owned manager
+        // after destruction has finished so resumed native texture IDs cannot
+        // leave IsDepthAvailable false, and its singleton assertion stays valid.
+        yield return null;
+        bool ready = false;
+        for (int frame = 0; frame < 180 && CanUseDepthNow; ++frame)
+        {
+            var loader = XRGeneralSettings.Instance?.Manager?.activeLoader;
+            var display = loader != null ? loader.GetLoadedSubsystem<XRDisplaySubsystem>() : null;
+            ready = display != null && display.running && OVRManager.OVRManagerinitialized &&
+                    EnvironmentDepthManager.IsSupported;
+            if (ready)
+                break;
+            yield return null;
+        }
+        if (!CanUseDepthNow)
+        {
+            depthStartRoutine = null;
+            yield break;
+        }
+        if (!ready)
+        {
+            depthStartRoutine = null;
+            Debug.LogWarning("GSAC environment depth is unavailable on this headset/runtime. Passthrough and virtual-object rendering remain active.");
+            yield break;
+        }
+        if (FindObjectOfType<EnvironmentDepthManager>(true) != null)
+        {
+            depthStartRoutine = null;
+            Debug.LogError("GSAC depth requires a single environment-depth owner. Another EnvironmentDepthManager already exists; no duplicate was created.");
+            yield break;
+        }
+
+        // Oculus XR 4.2 rejects depth texture creation in MultiPass. Stop before
+        // allocating the native provider so a mismatched build cannot spam a
+        // failed depth request on every render frame.
+        if (XRSettings.stereoRenderingMode == XRSettings.StereoRenderingMode.MultiPass)
+        {
+            depthStartRoutine = null;
+            Debug.LogError("GSAC environment depth requires Oculus Multiview. Rebuild with the depth profile; no depth provider was started.");
+            yield break;
+        }
+
+        SyncTrackingSpace();
+        var depthObject = new GameObject("Environment Depth");
+        depthObject.SetActive(false);
+        depthObject.transform.SetParent(depthRuntimeRoot.transform, false);
+        depthManager = depthObject.AddComponent<EnvironmentDepthManager>();
+        depthManager.OcclusionShadersMode = OcclusionShadersMode.SoftOcclusion;
+        depthManager.RemoveHands = false;
+        depthObject.SetActive(true);
+        depthStartedAt = Time.unscaledTime;
+        previousDepthAvailable = false;
+        reportedDepthTimeout = false;
+        depthStartRoutine = null;
+        RequestScenePermissionIfNeeded();
+    }
+
+    void ReleaseDepthManager()
+    {
+        if (depthStartRoutine != null)
+        {
+            StopCoroutine(depthStartRoutine);
+            depthStartRoutine = null;
+        }
+        if (depthManager != null)
+        {
+            depthManager.enabled = false;
+            Destroy(depthManager.gameObject);
+            depthManager = null;
+        }
+        previousDepthAvailable = false;
     }
 
     void ConfigureCameras()
@@ -168,271 +531,114 @@ public sealed class QuestARBootstrap : MonoBehaviour
         {
             if (camera == null || camera.targetTexture != null)
                 continue;
-
             camera.clearFlags = CameraClearFlags.SolidColor;
             camera.backgroundColor = new Color(0, 0, 0, 0);
-            EnsureComponent("UnityEngine.XR.ARFoundation.ARCameraManager, Unity.XR.ARFoundation", camera.gameObject);
-            EnsureComponent("UnityEngine.XR.ARFoundation.ARCameraBackground, Unity.XR.ARFoundation", camera.gameObject);
-            if (kEnableRealWorldEnvironmentOcclusion)
-                ConfigureOcclusionManager(camera.gameObject);
-            else
-                DisableOcclusionManager(camera.gameObject);
+            if (!useOculusProfile)
+            {
+                EnsureComponent("UnityEngine.XR.ARFoundation.ARCameraManager, Unity.XR.ARFoundation", camera.gameObject);
+                EnsureComponent("UnityEngine.XR.ARFoundation.ARCameraBackground, Unity.XR.ARFoundation", camera.gameObject);
+            }
         }
+        DisableEnvironmentOcclusionManagers();
+    }
+
+    static void DisableARFoundationManagers()
+    {
+        SetBehavioursEnabled<ARSession>(false);
+        SetBehavioursEnabled<ARCameraManager>(false);
+        SetBehavioursEnabled<ARCameraBackground>(false);
+        SetBehavioursEnabled<ARPlaneManager>(false);
+        SetBehavioursEnabled<ARRaycastManager>(false);
+        DisableEnvironmentOcclusionManagers();
+    }
+
+    static void SetBehavioursEnabled<T>(bool enabled) where T : Behaviour
+    {
+        foreach (var behaviour in FindObjectsOfType<T>(true))
+            behaviour.enabled = enabled;
     }
 
     static void DisableEnvironmentOcclusionManagers()
     {
-        foreach (var occlusionManager in FindObjectsOfType<AROcclusionManager>(true))
+        foreach (var manager in FindObjectsOfType<AROcclusionManager>(true))
         {
-            if (occlusionManager == null)
-                continue;
-
-            occlusionManager.requestedEnvironmentDepthMode = EnvironmentDepthMode.Disabled;
-            occlusionManager.requestedOcclusionPreferenceMode = OcclusionPreferenceMode.NoOcclusion;
-            occlusionManager.enabled = false;
+            manager.requestedEnvironmentDepthMode = EnvironmentDepthMode.Disabled;
+            manager.requestedOcclusionPreferenceMode = OcclusionPreferenceMode.NoOcclusion;
+            manager.enabled = false;
         }
-    }
-
-    static void DisableOcclusionManager(GameObject cameraObject)
-    {
-        if (cameraObject == null)
-            return;
-
-        var occlusionManager = cameraObject.GetComponent<AROcclusionManager>();
-        if (occlusionManager == null)
-            return;
-
-        occlusionManager.requestedEnvironmentDepthMode = EnvironmentDepthMode.Disabled;
-        occlusionManager.requestedOcclusionPreferenceMode = OcclusionPreferenceMode.NoOcclusion;
-        occlusionManager.enabled = false;
-    }
-
-    void ConfigureOcclusionManager(GameObject cameraObject)
-    {
-        if (cameraObject == null)
-            return;
-
-        var occlusionManager = cameraObject.GetComponent<AROcclusionManager>() ?? cameraObject.AddComponent<AROcclusionManager>();
-        occlusionManager.requestedEnvironmentDepthMode = EnvironmentDepthMode.Fastest;
-        occlusionManager.requestedOcclusionPreferenceMode = OcclusionPreferenceMode.PreferEnvironmentOcclusion;
-        occlusionManager.environmentDepthTemporalSmoothingRequested = true;
-        occlusionManager.enabled = true;
-    }
-
-    void ConfigureMetaDepthApi()
-    {
-        Type depthManagerType = Type.GetType("Meta.XR.EnvironmentDepth.EnvironmentDepthManager, Meta.XR.EnvironmentDepth");
-        if (depthManagerType == null)
-            return;
-
-        GameObject depthRoot = GameObject.Find("Quest Meta Depth Runtime");
-        if (depthRoot == null)
-        {
-            depthRoot = new GameObject("Quest Meta Depth Runtime");
-            DontDestroyOnLoad(depthRoot);
-        }
-
-        Type ovrManagerType = Type.GetType("OVRManager, Oculus.VR");
-        Component ovrManager = EnsureOptionalComponent(ovrManagerType, depthRoot);
-        if (ovrManager != null)
-        {
-            SetMemberValue(ovrManager, "isInsightPassthroughEnabled", true);
-            SetMemberValue(ovrManager, "requestScenePermissionOnStartup", true);
-            SetMemberValue(ovrManager, "SimultaneousHandsAndControllersEnabled", true);
-            SetMemberValue(ovrManager, "launchSimultaneousHandsControllersOnStartup", true);
-            SetEnumMemberValue(ovrManager, "trackingOriginType", "FloorLevel");
-            EnableSimultaneousHandsAndControllersIfAvailable();
-        }
-
-        Type passthroughLayerType = Type.GetType("OVRPassthroughLayer, Oculus.VR");
-        Component passthroughLayer = EnsureOptionalComponent(passthroughLayerType, depthRoot);
-        if (passthroughLayer != null)
-        {
-            SetEnumMemberValue(passthroughLayer, "overlayType", "Underlay");
-            if (passthroughLayer is Behaviour passthroughBehaviour)
-                passthroughBehaviour.enabled = true;
-        }
-
-        Type cameraRigType = Type.GetType("OVRCameraRig, Oculus.VR");
-        Component cameraRig = EnsureOptionalComponent(cameraRigType, depthRoot);
-        if (cameraRig != null)
-            SetMemberValue(cameraRig, "disableEyeAnchorCameras", true);
-
-        Component depthManager = EnsureOptionalComponent(depthManagerType, depthRoot);
-        if (depthManager != null)
-        {
-            SetEnumMemberValue(depthManager, "OcclusionShadersMode", "SoftOcclusion");
-            SetMemberValue(depthManager, "RemoveHands", false);
-            if (depthManager is Behaviour behaviour)
-                behaviour.enabled = true;
-        }
-
-        RequestScenePermissionIfNeeded();
     }
 
     void ApplyDepthOcclusionShaderToOrdinaryObjects()
     {
-        Shader occlusionShader = Shader.Find("GSAC/Quest Depth Occluded Color");
-        if (occlusionShader == null)
-            occlusionShader = Shader.Find("Meta/Depth/BiRP/Occlusion Standard");
-        if (occlusionShader == null)
-            return;
-
-        ApplyDepthOcclusionShader(GameObject.Find("Sphere (1)"), occlusionShader);
-
-        foreach (var grabbable in FindObjectsOfType<GrabbableTestBall>(true))
+        Shader shader = Shader.Find("GSAC/Quest Depth Occluded Color");
+        if (shader == null)
         {
-            if (grabbable != null)
-                ApplyDepthOcclusionShader(grabbable.gameObject, occlusionShader);
+            Debug.LogError("GSAC ordinary-object depth shader is missing from the build.");
+            return;
         }
+        ApplyDepthOcclusionShader(GameObject.Find("Sphere (1)"), shader);
+        foreach (var ball in FindObjectsOfType<GrabbableTestBall>(true))
+            ApplyDepthOcclusionShader(ball.gameObject, shader);
     }
 
-    static void ApplyDepthOcclusionShader(GameObject root, Shader occlusionShader)
+    void ApplyDepthOcclusionShader(GameObject root, Shader shader)
     {
-        if (root == null || occlusionShader == null)
+        if (root == null)
             return;
-
-        foreach (Renderer renderer in root.GetComponentsInChildren<Renderer>(true))
+        foreach (var renderer in root.GetComponentsInChildren<Renderer>(true))
         {
-            if (renderer == null)
+            // Keep controller rays, UI and skinned proxy materials intact.
+            if (!(renderer is MeshRenderer))
                 continue;
-
-            Material[] materials = renderer.sharedMaterials;
-            bool changed = false;
-            for (int i = 0; i < materials.Length; ++i)
+            if (!replacedRenderers.Add(renderer))
+                continue;
+            Material[] originals = renderer.sharedMaterials;
+            var instances = new Material[originals.Length];
+            for (int i = 0; i < originals.Length; ++i)
             {
-                Material material = materials[i];
-                if (material == null || material.shader == occlusionShader)
+                if (originals[i] == null)
                     continue;
-
-                material.shader = occlusionShader;
-                if (material.HasProperty("_EnvironmentDepthBias"))
-                    material.SetFloat("_EnvironmentDepthBias", 0.0f);
-                changed = true;
+                instances[i] = new Material(originals[i]) { shader = shader, name = originals[i].name + " (Quest depth runtime)" };
+                instances[i].SetFloat("_EnvironmentDepthBias", 0.0f);
             }
-
-            if (changed)
-                renderer.sharedMaterials = materials;
+            renderer.sharedMaterials = instances;
+            materialReplacements.Add(new MaterialReplacement { renderer = renderer, originals = originals, instances = instances });
         }
     }
 
-    static Component EnsureOptionalComponent(Type type, GameObject target)
+    void RestoreOrdinaryMaterials()
     {
-        if (type == null || target == null || !typeof(Component).IsAssignableFrom(type))
-            return null;
-
-        var existing = FindObjectOfType(type, true) as Component;
-        if (existing != null)
-            return existing;
-
-        return target.GetComponent(type) ?? target.AddComponent(type);
+        foreach (var replacement in materialReplacements)
+        {
+            if (replacement.renderer != null)
+                replacement.renderer.sharedMaterials = replacement.originals;
+            foreach (var instance in replacement.instances)
+                if (instance != null)
+                    Destroy(instance);
+        }
+        materialReplacements.Clear();
+        replacedRenderers.Clear();
     }
 
     static void RequestScenePermissionIfNeeded()
     {
 #if UNITY_ANDROID && !UNITY_EDITOR
-        const string scenePermission = "com.oculus.permission.USE_SCENE";
-        if (!UnityEngine.Android.Permission.HasUserAuthorizedPermission(scenePermission))
-            UnityEngine.Android.Permission.RequestUserPermission(scenePermission);
+        const string permission = "com.oculus.permission.USE_SCENE";
+        if (!s_ScenePermissionRequested && !UnityEngine.Android.Permission.HasUserAuthorizedPermission(permission))
+        {
+            s_ScenePermissionRequested = true;
+            UnityEngine.Android.Permission.RequestUserPermission(permission);
+        }
 #endif
-    }
-
-    static void EnableSimultaneousHandsAndControllersIfAvailable()
-    {
-        try
-        {
-            Type ovrPluginType = Type.GetType("OVRPlugin, Oculus.VR");
-            MethodInfo supportMethod = ovrPluginType?.GetMethod(
-                "SetMultimodalHandsControllersSupported",
-                BindingFlags.Static | BindingFlags.Public);
-            supportMethod?.Invoke(null, new object[] { true });
-
-            Type ovrInputType = Type.GetType("OVRInput, Oculus.VR");
-            MethodInfo method = ovrInputType?.GetMethod(
-                "EnableSimultaneousHandsAndControllers",
-                BindingFlags.Static | BindingFlags.Public);
-
-            if (method == null || method.ReturnType != typeof(bool))
-                return;
-
-            bool enabled = (bool)method.Invoke(null, null);
-            if (!enabled)
-                Debug.Log("Quest AR requested simultaneous hands/controllers, but the current runtime did not enable it.");
-        }
-        catch (Exception exception)
-        {
-            Debug.Log($"Quest AR could not enable simultaneous hands/controllers: {exception.Message}");
-        }
-    }
-
-    static void SetMemberValue(Component component, string memberName, object value)
-    {
-        if (component == null || string.IsNullOrEmpty(memberName))
-            return;
-
-        Type type = component.GetType();
-        PropertyInfo property = type.GetProperty(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (property != null && property.CanWrite)
-        {
-            property.SetValue(component, value);
-            return;
-        }
-
-        FieldInfo field = type.GetField(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (field != null)
-            field.SetValue(component, value);
-    }
-
-    static void SetEnumMemberValue(Component component, string memberName, string enumValue)
-    {
-        if (component == null || string.IsNullOrEmpty(memberName) || string.IsNullOrEmpty(enumValue))
-            return;
-
-        Type type = component.GetType();
-        PropertyInfo property = type.GetProperty(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (property != null && property.CanWrite && property.PropertyType.IsEnum)
-        {
-            property.SetValue(component, Enum.Parse(property.PropertyType, enumValue));
-            return;
-        }
-
-        FieldInfo field = type.GetField(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-        if (field != null && field.FieldType.IsEnum)
-            field.SetValue(component, Enum.Parse(field.FieldType, enumValue));
-    }
-
-    IEnumerator ReportOcclusionStatus()
-    {
-        for (int frame = 0; frame < 60; ++frame)
-            yield return null;
-
-        foreach (var occlusionManager in FindObjectsOfType<AROcclusionManager>(true))
-        {
-            if (occlusionManager == null || !occlusionManager.enabled)
-                continue;
-
-            if (occlusionManager.currentEnvironmentDepthMode == EnvironmentDepthMode.Disabled)
-            {
-                Debug.LogWarning("Quest AR real-world occlusion requested environment depth, but no active environment depth provider is available. Physical desks/hands will not hide virtual objects until the Meta OpenXR occlusion provider is installed and enabled.");
-            }
-            else
-            {
-                Debug.Log($"Quest AR real-world occlusion active. Environment depth mode: {occlusionManager.currentEnvironmentDepthMode}.");
-            }
-
-            yield break;
-        }
-
-        Debug.LogWarning("Quest AR real-world occlusion manager was not found on an AR camera.");
     }
 
     void HideTestEnvironment()
     {
         foreach (string objectName in s_DefaultObjectsToHide)
         {
-            var go = GameObject.Find(objectName);
-            if (go != null)
-                go.SetActive(false);
+            var root = GameObject.Find(objectName);
+            if (root != null)
+                root.SetActive(false);
         }
     }
 
@@ -442,29 +648,17 @@ public sealed class QuestARBootstrap : MonoBehaviour
         if (type == null || !typeof(Component).IsAssignableFrom(type))
         {
             if (s_WarnedMissingTypes.Add(typeName))
-                Debug.LogWarning($"Quest AR setup could not find component type '{typeName}'. Make sure AR Foundation and Unity OpenXR: Meta are installed.");
+                Debug.LogWarning($"Quest AR setup could not find component type '{typeName}'.");
             return null;
         }
-
         if (target == null)
         {
             var existing = FindObjectOfType(type) as Component;
             if (existing != null)
                 return existing;
-
             target = new GameObject(type.Name);
         }
-
         return target.GetComponent(type) ?? target.AddComponent(type);
-    }
-
-    static void RestartEnabledBehaviours(string typeName)
-    {
-        Type type = Type.GetType(typeName);
-        if (type == null || !typeof(Behaviour).IsAssignableFrom(type))
-            return;
-
-        RestartEnabledBehaviours(type);
     }
 
     static void RestartEnabledBehaviours(Type type)
@@ -472,12 +666,6 @@ public sealed class QuestARBootstrap : MonoBehaviour
         foreach (var obj in FindObjectsOfType(type, true))
         {
             var behaviour = (Behaviour)obj;
-            if (!behaviour.enabled)
-            {
-                behaviour.enabled = true;
-                continue;
-            }
-
             behaviour.enabled = false;
             behaviour.enabled = true;
         }

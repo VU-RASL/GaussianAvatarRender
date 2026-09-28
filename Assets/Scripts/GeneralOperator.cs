@@ -14,11 +14,13 @@ public sealed class GeneralOperator : MonoBehaviour
     [SerializeField] bool buildAR;
     [SerializeField] bool showHeadsetFps = false;
     [SerializeField] bool runPerformanceProtocol = false;
+    [SerializeField] bool useQuestEnvironmentDepth = false;
 
     public bool BuildVR => buildVR;
     public bool BuildAR => buildAR;
     public bool ShowHeadsetFps => showHeadsetFps;
     public bool RunPerformanceProtocol => runPerformanceProtocol;
+    public bool UseQuestEnvironmentDepth => useQuestEnvironmentDepth;
     public GeneralBuildMode Mode => buildAR ? GeneralBuildMode.AR : GeneralBuildMode.VR;
 
     public void SetMode(GeneralBuildMode mode)
@@ -44,6 +46,13 @@ public sealed class GeneralOperator : MonoBehaviour
     {
         var generalOperator = FindObjectOfType<GeneralOperator>(true);
         return generalOperator != null && generalOperator.ShowHeadsetFps;
+    }
+
+    public static bool GetSceneEnvironmentDepthEnabled()
+    {
+        var generalOperator = FindObjectOfType<GeneralOperator>(true);
+        return generalOperator != null && generalOperator.Mode == GeneralBuildMode.AR &&
+               generalOperator.UseQuestEnvironmentDepth;
     }
 
     void Reset()
@@ -74,12 +83,13 @@ public sealed class GeneralOperator : MonoBehaviour
     public void ApplySceneModeComponents()
     {
         bool enableAR = Mode == GeneralBuildMode.AR;
-        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARSession, Unity.XR.ARFoundation", enableAR);
-        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARCameraManager, Unity.XR.ARFoundation", enableAR);
-        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARCameraBackground, Unity.XR.ARFoundation", enableAR);
+        bool enableARFoundation = enableAR && !QuestARBootstrap.IsOculusLoaderConfigured();
+        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARSession, Unity.XR.ARFoundation", enableARFoundation);
+        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARCameraManager, Unity.XR.ARFoundation", enableARFoundation);
+        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARCameraBackground, Unity.XR.ARFoundation", enableARFoundation);
         SetComponentsEnabled("UnityEngine.XR.ARFoundation.AROcclusionManager, Unity.XR.ARFoundation", false);
-        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARPlaneManager, Unity.XR.ARFoundation", enableAR);
-        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARRaycastManager, Unity.XR.ARFoundation", enableAR);
+        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARPlaneManager, Unity.XR.ARFoundation", enableARFoundation);
+        SetComponentsEnabled("UnityEngine.XR.ARFoundation.ARRaycastManager, Unity.XR.ARFoundation", enableARFoundation);
         SetComponentsEnabled(typeof(ARGroundPlacement), enableAR);
         SetComponentsEnabled(typeof(ARPoseControlPanel), false);
     }

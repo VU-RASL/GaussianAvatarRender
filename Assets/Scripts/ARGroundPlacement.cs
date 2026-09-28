@@ -26,6 +26,8 @@ public sealed class ARGroundPlacement : MonoBehaviour
     bool configuredXROrigin;
     bool placedOnce;
     bool placedOnDetectedGround;
+    bool useXRTrackingFloor;
+    bool isARMode;
 
     void OnEnable()
     {
@@ -33,13 +35,15 @@ public sealed class ARGroundPlacement : MonoBehaviour
         configuredXROrigin = false;
         placedOnce = false;
         placedOnDetectedGround = false;
+        isARMode = GeneralOperator.GetSceneMode() == GeneralBuildMode.AR;
+        useXRTrackingFloor = QuestARBootstrap.IsOculusLoaderConfigured();
         EnsureReferences();
         PlaceAvatarOnGround();
     }
 
     void Update()
     {
-        if (GeneralOperator.GetSceneMode() != GeneralBuildMode.AR)
+        if (!isARMode)
             return;
 
         if (placedOnDetectedGround)
@@ -71,6 +75,14 @@ public sealed class ARGroundPlacement : MonoBehaviour
             return;
 
         ConfigureXROriginForAR();
+
+        // Oculus XR has no ARFoundation plane/raycast provider. Its floor tracking
+        // origin supplies placement height; environment depth only handles occlusion.
+        if (useXRTrackingFloor)
+        {
+            StopGroundDetection();
+            return;
+        }
 
         if (planeManager == null)
             planeManager = xrOrigin.GetComponent<ARPlaneManager>() ?? xrOrigin.gameObject.AddComponent<ARPlaneManager>();
@@ -146,6 +158,8 @@ public sealed class ARGroundPlacement : MonoBehaviour
     bool TryGetDetectedGround(Vector3 target, out float groundY)
     {
         groundY = 0.0f;
+        if (useXRTrackingFloor)
+            return false;
         float rayStartY = Mathf.Max(target.y, arCamera.transform.position.y) + 0.25f;
         Ray downRay = new(new Vector3(target.x, rayStartY, target.z), Vector3.down);
 

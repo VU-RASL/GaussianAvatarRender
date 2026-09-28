@@ -4,6 +4,7 @@ Shader "GSAC/Quest Depth Occluded Color"
     {
         _Color("Color", Color) = (1, 1, 1, 1)
         _EnvironmentDepthBias("Environment Depth Bias", Float) = 0.0
+        _EnvironmentDepthEdgeSharpness("Depth Edge Sharpness", Range(0, 1)) = 0.25
     }
 
     SubShader
@@ -20,10 +21,11 @@ Shader "GSAC/Quest Depth Occluded Color"
             ZTest LEqual
 
             CGPROGRAM
-            #pragma target 3.0
+            #pragma target 3.5
             #pragma vertex vert
             #pragma fragment frag
             #pragma multi_compile _ HARD_OCCLUSION SOFT_OCCLUSION
+            #pragma multi_compile_instancing
 
             #include "UnityCG.cginc"
             #include "Lighting.cginc"
@@ -31,6 +33,7 @@ Shader "GSAC/Quest Depth Occluded Color"
 
             fixed4 _Color;
             float _EnvironmentDepthBias;
+            half _EnvironmentDepthEdgeSharpness;
 
             struct appdata
             {
@@ -71,9 +74,22 @@ Shader "GSAC/Quest Depth Occluded Color"
                 half3 normal = normalize(i.worldNormal);
                 half ndotl = saturate(dot(normal, normalize(_WorldSpaceLightPos0.xyz)));
                 half3 litColor = _Color.rgb * (UNITY_LIGHTMODEL_AMBIENT.rgb + _LightColor0.rgb * (0.35 + 0.65 * ndotl));
-                fixed4 color = fixed4(litColor, _Color.a);
-                META_DEPTH_OCCLUDE_OUTPUT_PREMULTIPLY(i, color, _EnvironmentDepthBias);
-                return color;
+                half visibility = 1;
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+                visibility = CalculateEnvironmentDepthOcclusion(i.worldPos, _EnvironmentDepthBias);
+#if defined(SOFT_OCCLUSION)
+                // Tighten the SDK's broad feather for ordinary opaque objects.
+                // Default 0.25 limits noise amplification on moving depth edges.
+                // Zero preserves the SDK curve; one is the strongest contraction.
+                // Reuse the same depth sample and retain premultiplied coverage.
+                visibility = lerp(visibility, smoothstep(0.2h, 0.8h, visibility),
+                                  saturate(_EnvironmentDepthEdgeSharpness));
+#endif
+                if (visibility < 0.01h)
+                    discard;
+#endif
+                half alpha = _Color.a * visibility;
+                return half4(litColor * alpha, alpha);
             }
             ENDCG
         }

@@ -1,5 +1,6 @@
 #if UNITY_EDITOR
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Xml;
 using UnityEditor;
@@ -7,7 +8,12 @@ using UnityEditor.Android;
 using UnityEditor.Build;
 using UnityEditor.Build.Reporting;
 using UnityEditor.SceneManagement;
+using UnityEditor.XR.Management;
+using UnityEditor.XR.Management.Metadata;
+using Unity.XR.Oculus;
 using UnityEngine;
+using UnityEngine.SceneManagement;
+using UnityEngine.XR.Management;
 using UnityEngine.XR.OpenXR;
 using UnityEngine.XR.OpenXR.Features;
 
@@ -18,6 +24,7 @@ public sealed class GeneralOperatorEditor : Editor
     SerializedProperty buildAR;
     SerializedProperty showHeadsetFps;
     SerializedProperty runPerformanceProtocol;
+    SerializedProperty useQuestEnvironmentDepth;
 
     void OnEnable()
     {
@@ -25,6 +32,7 @@ public sealed class GeneralOperatorEditor : Editor
         buildAR = serializedObject.FindProperty("buildAR");
         showHeadsetFps = serializedObject.FindProperty("showHeadsetFps");
         runPerformanceProtocol = serializedObject.FindProperty("runPerformanceProtocol");
+        useQuestEnvironmentDepth = serializedObject.FindProperty("useQuestEnvironmentDepth");
     }
 
     public override void OnInspectorGUI()
@@ -60,33 +68,104 @@ public sealed class GeneralOperatorEditor : Editor
             buildAR.boolValue = requestedMode.Value == GeneralBuildMode.AR;
         }
 
+        EditorGUILayout.Space();
+        EditorGUILayout.LabelField("Real-world Occlusion", EditorStyles.boldLabel);
+        using (new EditorGUI.DisabledScope(!buildAR.boolValue || EditorApplication.isPlaying))
+        {
+            EditorGUILayout.PropertyField(useQuestEnvironmentDepth, new GUIContent(
+                "Use Quest environment depth (experimental)",
+                "AR builds only. Uses the installed Oculus XR 4.2 depth provider instead of OpenXR. " +
+                "Placement uses the XR floor height rather than detected AR planes. " +
+                "Selects Multiview, which the Oculus environment depth provider requires. " +
+                "Verify both eyes and performance on the headset."));
+        }
+        if (buildAR.boolValue && useQuestEnvironmentDepth.boolValue)
+        {
+            EditorGUILayout.HelpBox(
+                "Experimental Oculus XR depth profile: real hands and surfaces can occlude supported objects. " +
+                "AR plane detection is replaced by XR floor placement. Oculus Multiview is required because " +
+                "the depth provider cannot produce depth frames in Multi Pass. Check both eyes and compare headset " +
+                "performance before relying on it. Turn this off and rebuild to return to the OpenXR baseline.",
+                MessageType.Warning);
+        }
+
         if (serializedObject.ApplyModifiedProperties())
         {
             foreach (Object selectedTarget in targets)
             {
                 var generalOperator = (GeneralOperator)selectedTarget;
+                if (!EditorApplication.isPlaying)
+                    GeneralOperatorOpenXRUtility.ApplyProfile(generalOperator);
                 generalOperator.ApplySceneModeComponents();
                 EditorUtility.SetDirty(generalOperator);
                 EditorSceneManager.MarkSceneDirty(generalOperator.gameObject.scene);
-                GeneralOperatorOpenXRUtility.ApplyMode(generalOperator.Mode);
             }
         }
     }
 }
 
-public sealed class GeneralOperatorBuildProcessor : IPreprocessBuildWithReport
+public sealed class GeneralOperatorBuildProcessor : IPreprocessBuildWithReport, IProcessSceneWithReport
 {
-    public int callbackOrder => 0;
+    // Select the provider before XR Management and Oculus serialize their settings.
+    public int callbackOrder => -1000;
 
     public void OnPreprocessBuild(BuildReport report)
     {
         if (report.summary.platform != BuildTarget.Android)
             return;
 
-        GeneralBuildMode mode = GeneralOperatorOpenXRUtility.FindLoadedOperatorMode();
-        GeneralOperatorOpenXRUtility.ApplyMode(mode);
+        GeneralOperator generalOperator = GeneralOperatorOpenXRUtility.FindLoadedOperator();
+        GeneralOperatorOpenXRUtility.ApplyProfile(generalOperator);
         GeneralOperatorOpenXRUtility.EnsureShaderIncluded("GSAC/Headset FPS Overlay");
+        GeneralBuildMode mode = generalOperator != null ? generalOperator.Mode : GeneralBuildMode.VR;
         Debug.Log($"General Operator build mode for Android: {mode}");
+    }
+
+    public void OnProcessScene(Scene scene, BuildReport report)
+    {
+        if (!BuildPipeline.isBuildingPlayer || report == null || report.summary.platform != BuildTarget.Android)
+            return;
+
+        XRGeneralSettings settings = XRGeneralSettingsPerBuildTarget
+            .XRGeneralSettingsForBuildTarget(BuildTargetGroup.Android);
+        XRManagerSettings manager = settings != null ? settings.Manager : null;
+        string[] loaders = manager != null
+            ? manager.activeLoaders.Select(loader => loader != null ? loader.GetType().FullName : "<null>").ToArray()
+            : new string[0];
+
+        // Validate the actual serialized build scene, not the currently open
+        // editor scene used by preprocessing. Unsaved flags must never select
+        // one provider while the player silently loads another scene profile.
+        foreach (GameObject root in scene.GetRootGameObjects())
+        {
+            foreach (GeneralOperator generalOperator in root.GetComponentsInChildren<GeneralOperator>(true))
+            {
+                bool depthRequested = generalOperator.Mode == GeneralBuildMode.AR &&
+                                      generalOperator.UseQuestEnvironmentDepth;
+                string expected = depthRequested
+                    ? "Unity.XR.Oculus.OculusLoader" : "UnityEngine.XR.OpenXR.OpenXRLoader";
+                if (loaders.Length != 1 || loaders[0] != expected)
+                {
+                    throw new BuildFailedException(
+                        $"GSAC build profile mismatch in scene '{scene.path}' on '{generalOperator.name}': " +
+                        $"serialized mode={generalOperator.Mode}, environment depth requested={depthRequested}, " +
+                        $"requires exactly one Android loader '{expected}', but selected [{string.Join(", ", loaders)}]. " +
+                        "Save the intended General Operator settings in the scene, apply that build profile, " +
+                        "and rebuild. The build was stopped without saving or modifying the scene.");
+                }
+
+                if (depthRequested &&
+                    (!EditorBuildSettings.TryGetConfigObject<OculusSettings>("Unity.XR.Oculus.Settings", out var oculusSettings) ||
+                     oculusSettings == null ||
+                     oculusSettings.m_StereoRenderingModeAndroid != OculusSettings.StereoRenderingModeAndroid.Multiview))
+                {
+                    throw new BuildFailedException(
+                        $"GSAC environment depth in scene '{scene.path}' requires Oculus Multiview. " +
+                        "The Oculus XR depth provider cannot produce depth frames in Multi Pass. " +
+                        "Apply the General Operator build profile and rebuild.");
+                }
+            }
+        }
     }
 }
 
@@ -139,6 +218,12 @@ public static class GeneralOperatorOpenXRUtility
 
     public static GeneralBuildMode FindLoadedOperatorMode()
     {
+        GeneralOperator generalOperator = FindLoadedOperator();
+        return generalOperator != null ? generalOperator.Mode : GeneralBuildMode.VR;
+    }
+
+    public static GeneralOperator FindLoadedOperator()
+    {
         foreach (GeneralOperator generalOperator in Resources.FindObjectsOfTypeAll<GeneralOperator>())
         {
             if (generalOperator == null)
@@ -147,16 +232,91 @@ public static class GeneralOperatorOpenXRUtility
             if (!generalOperator.gameObject.scene.IsValid())
                 continue;
 
-            return generalOperator.Mode;
+            return generalOperator;
         }
 
-        return GeneralBuildMode.VR;
+        return null;
     }
 
     [MenuItem("Gaussian Splatting/Apply General Operator Build Mode")]
     public static void ApplyCurrentMode()
     {
-        ApplyMode(FindLoadedOperatorMode());
+        ApplyProfile(FindLoadedOperator());
+    }
+
+    public static void ApplyProfile(GeneralOperator generalOperator)
+    {
+        if (EditorApplication.isPlayingOrWillChangePlaymode)
+            return;
+
+        GeneralBuildMode mode = generalOperator != null ? generalOperator.Mode : GeneralBuildMode.VR;
+        bool useDepth = mode == GeneralBuildMode.AR && generalOperator != null &&
+                        generalOperator.UseQuestEnvironmentDepth;
+        SelectAndroidLoader(useDepth);
+        if (useDepth)
+        {
+            ConfigureOculusDepthSettings();
+            EnsureShaderIncluded("GSAC/Quest Depth Occluded Color");
+            EnsureShaderIncluded("Gaussian Splatting/Render Splats");
+            Debug.LogWarning("GSAC experimental environment depth uses Oculus XR 4.2 with required Multiview rendering. " +
+                             "The Oculus depth provider does not support Multi Pass. Validate both eyes, " +
+                             "real-world occlusion and performance on the headset; AR placement uses XR floor height.");
+        }
+        else
+        {
+            // Keep the existing OpenXR feature configuration workflow for baseline builds.
+            ApplyMode(mode);
+        }
+    }
+
+    static void SelectAndroidLoader(bool useDepth)
+    {
+        XRGeneralSettings settings = XRGeneralSettingsPerBuildTarget.XRGeneralSettingsForBuildTarget(BuildTargetGroup.Android);
+        XRManagerSettings manager = settings != null ? settings.Manager : null;
+        if (manager == null)
+            throw new BuildFailedException("GSAC could not find Android XR Management settings. Configure XR Plug-in Management first.");
+
+        string loaderType = useDepth ? "Unity.XR.Oculus.OculusLoader" : "UnityEngine.XR.OpenXR.OpenXRLoader";
+        // Assign first so a missing provider cannot leave the project without its previous loader.
+        if (!manager.activeLoaders.Any(loader => loader != null && loader.GetType().FullName == loaderType) &&
+            !XRPackageMetadataStore.AssignLoader(manager, loaderType, BuildTargetGroup.Android))
+            throw new BuildFailedException("GSAC could not select the Android XR loader: " + loaderType);
+
+        foreach (XRLoader loader in manager.activeLoaders.ToArray())
+        {
+            if (loader != null && loader.GetType().FullName != loaderType &&
+                !XRPackageMetadataStore.RemoveLoader(manager, loader.GetType().FullName, BuildTargetGroup.Android))
+                throw new BuildFailedException("GSAC could not remove the conflicting Android XR loader: " + loader.GetType().FullName);
+        }
+        if (manager.activeLoaders.Count != 1 || manager.activeLoaders[0] == null ||
+            manager.activeLoaders[0].GetType().FullName != loaderType)
+            throw new BuildFailedException("GSAC Android XR loader selection did not produce a single provider: " + loaderType);
+
+        EditorUtility.SetDirty(manager);
+        AssetDatabase.SaveAssets();
+    }
+
+    static void ConfigureOculusDepthSettings()
+    {
+        const string settingsKey = "Unity.XR.Oculus.Settings";
+        if (!EditorBuildSettings.TryGetConfigObject<OculusSettings>(settingsKey, out var settings) || settings == null)
+        {
+            // Recover a dangling configuration reference using the existing asset's GUID.
+            settings = AssetDatabase.LoadAssetAtPath<OculusSettings>("Assets/XR/Settings/OculusSettings.asset");
+            if (settings == null)
+                throw new BuildFailedException("GSAC could not find Assets/XR/Settings/OculusSettings.asset.");
+            EditorBuildSettings.AddConfigObject(settingsKey, settings, true);
+        }
+
+        // The Oculus provider fails to create environment depth textures in Multi Pass.
+        settings.m_StereoRenderingModeAndroid = OculusSettings.StereoRenderingModeAndroid.Multiview;
+        // Preserve each eye's native projection; symmetric projection is an optional optimization.
+        settings.SymmetricProjection = false;
+        // Gaussian color rendering reuses opaque camera depth after switching color targets.
+        // Oculus Vulkan discard optimization may invalidate that depth at the pass boundary.
+        settings.OptimizeBufferDiscards = false;
+        EditorUtility.SetDirty(settings);
+        AssetDatabase.SaveAssets();
     }
 
     public static void ApplyMode(GeneralBuildMode mode)

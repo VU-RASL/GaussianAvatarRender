@@ -14,7 +14,10 @@ Shader "Gaussian Splatting/Render Splats"
         {
             ZWrite Off
             ZTest [_GaussianSceneZTest]
-            Blend OneMinusDstAlpha		 One
+            Blend 0 OneMinusDstAlpha One
+            Blend 1 One One
+            BlendOp 1 Max
+            ColorMask R 1
             Cull Off
 			
             
@@ -22,10 +25,18 @@ CGPROGRAM
 #pragma vertex vert
 #pragma fragment frag
 #pragma require compute
-#pragma use_dxc
+// Use Unity's default compiler so native Multiview gl_ViewID is translated.
+#pragma multi_compile _ HARD_OCCLUSION SOFT_OCCLUSION
+#pragma multi_compile _ GSAC_ENV_VISIBILITY_CAP
+#pragma multi_compile _ STEREO_INSTANCING_ON STEREO_MULTIVIEW_ON
 
 #include "UnityCG.cginc"
 #include "GaussianSplatting.hlsl"
+
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+#include "Packages/com.meta.xr.sdk.core/Shaders/EnvironmentDepth/BiRP/EnvironmentOcclusionBiRP.cginc"
+float _GsacEnvironmentDepthBias;
+#endif
 
 StructuredBuffer<uint> _OrderBuffer;
 StructuredBuffer<vector> _TBuffer;
@@ -35,6 +46,9 @@ struct v2f
     half4 col : COLOR0;
     float2 pos : TEXCOORD0;
     float4 vertex : SV_POSITION;
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+    float3 environmentWorldPos : TEXCOORD1;
+#endif
     UNITY_VERTEX_OUTPUT_STEREO
 };
 
@@ -42,9 +56,20 @@ StructuredBuffer<SplatViewData> _SplatViewData;
 ByteAddressBuffer _SplatSelectedBits;
 uint _SplatBitsValid;
 float _GaussianSplatClipFlipY;
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+// Matches the projection used by CalcViewData, including render-target orientation.
+float4x4 _GsacEnvironmentInverseViewProjection;
+#endif
 
 v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
+#if defined(UNITY_STEREO_INSTANCING_ENABLED)
+    // Unity's stereo instance pair shares one Gaussian index. Multiview uses
+    // the hardware view ID instead and retains the original instance index.
+    UnitySetupInstanceID(instID);
+    UnitySetupCompoundMatrices();
+    instID = unity_InstanceID;
+#endif
     v2f o = (v2f)0;
     UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
     instID = _OrderBuffer[instID];
@@ -89,6 +114,12 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 		float2 deltaScreenPos = (quadPos.x * view.axis1 + quadPos.y * view.axis2) * 2 / _ScreenParams.xy;
 		o.vertex = centerClipPos;
 		o.vertex.xy += deltaScreenPos * centerClipPos.w;
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+        // Each billboard corner has its own world position: a real edge can cut
+        // through a splat instead of hiding the entire splat at its center.
+        float4 environmentWorld = mul(_GsacEnvironmentInverseViewProjection, o.vertex);
+        o.environmentWorldPos = environmentWorld.xyz / environmentWorld.w;
+#endif
 		if (_GaussianSplatClipFlipY > 0.5)
 			o.vertex.y = -o.vertex.y;
 
@@ -110,7 +141,16 @@ v2f vert (uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
     return o;
 }
 
+#if defined(GSAC_ENV_VISIBILITY_CAP)
+struct GsacFragmentOutput
+{
+    half4 color : SV_Target0;
+    float visibility : SV_Target1;
+};
+GsacFragmentOutput frag(v2f i)
+#else
 half4 frag (v2f i) : SV_Target
+#endif
 {
     UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
 	float power = -dot(i.pos, i.pos);
@@ -139,7 +179,31 @@ half4 frag (v2f i) : SV_Target
         discard;
 
     half4 res = half4(i.col.rgb * alpha, alpha);
+#if defined(GSAC_ENV_VISIBILITY_CAP)
+    float gsacVisibility = 1.0;
+#endif
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+    // Skip depth sampling for already discarded Gaussian tails. The SDK uses
+    // this eye's environment texture and preserves premultiplied alpha.
+#if defined(GSAC_ENV_VISIBILITY_CAP)
+    // Reuse the same sample for color attenuation and a separate visibility
+    // envelope. The envelope must not become opaque as splats accumulate.
+    gsacVisibility = CalculateEnvironmentDepthOcclusion(i.environmentWorldPos, _GsacEnvironmentDepthBias);
+    if (gsacVisibility < 0.01)
+        discard;
+    res *= gsacVisibility;
+#else
+    META_DEPTH_OCCLUDE_OUTPUT_PREMULTIPLY_WORLDPOS(i.environmentWorldPos, res, _GsacEnvironmentDepthBias);
+#endif
+#endif
+#if defined(GSAC_ENV_VISIBILITY_CAP)
+    GsacFragmentOutput output;
+    output.color = res;
+    output.visibility = gsacVisibility;
+    return output;
+#else
     return res;
+#endif
 }
 ENDCG
         }
@@ -148,17 +212,28 @@ ENDCG
         {
             ZWrite Off
             ZTest [_GaussianSceneZTest]
-            Blend OneMinusDstAlpha One
+            Blend 0 OneMinusDstAlpha One
+            Blend 1 One One
+            BlendOp 1 Max
+            ColorMask R 1
             Cull Off
 
 CGPROGRAM
 #pragma vertex vert
 #pragma fragment frag
 #pragma require compute
-#pragma use_dxc
+// Use Unity's default compiler so native Multiview gl_ViewID is translated.
+#pragma multi_compile _ HARD_OCCLUSION SOFT_OCCLUSION
+#pragma multi_compile _ GSAC_ENV_VISIBILITY_CAP
+#pragma multi_compile _ STEREO_INSTANCING_ON STEREO_MULTIVIEW_ON
 
 #include "UnityCG.cginc"
 #include "GaussianSplatting.hlsl"
+
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+#include "Packages/com.meta.xr.sdk.core/Shaders/EnvironmentDepth/BiRP/EnvironmentOcclusionBiRP.cginc"
+float _GsacEnvironmentDepthBias;
+#endif
 
 StructuredBuffer<uint> _OrderBuffer;
 ByteAddressBuffer _SplatSelectedBits;
@@ -172,6 +247,9 @@ struct v2f
     half4 col : COLOR0;
     float2 pos : TEXCOORD0;
     float4 vertex : SV_POSITION;
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+    float3 environmentWorldPos : TEXCOORD1;
+#endif
     UNITY_VERTEX_OUTPUT_STEREO
 };
 
@@ -183,7 +261,11 @@ void DecomposeCovarianceForVertex(float3 cov2d, out float2 v1, out float2 v2)
     float lambda1 = mid + radius;
     float lambda2 = max(mid - radius, 0.1);
     float2 diagVec = normalize(float2(offDiag, lambda1 - diag1));
+#if !defined(UNITY_STEREO_INSTANCING_ENABLED) && !defined(UNITY_STEREO_MULTIVIEW_ENABLED)
+    // Preserve the legacy 2D-target orientation. Stereo covariance below
+    // already contains the signed per-eye projection, so needs no Y reflection.
     diagVec.y = -diagVec.y;
+#endif
     float maxSize = 4096.0;
     v1 = min(sqrt(2.0 * lambda1), maxSize) * diagVec;
     v2 = min(sqrt(2.0 * lambda2), maxSize) * float2(diagVec.y, -diagVec.x);
@@ -191,6 +273,13 @@ void DecomposeCovarianceForVertex(float3 cov2d, out float2 v1, out float2 v2)
 
 v2f vert(uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
 {
+#if defined(UNITY_STEREO_INSTANCING_ENABLED)
+    // Unity's stereo instance pair shares one Gaussian index. Multiview uses
+    // the hardware view ID instead and retains the original instance index.
+    UnitySetupInstanceID(instID);
+    UnitySetupCompoundMatrices();
+    instID = unity_InstanceID;
+#endif
     v2f o = (v2f)0;
     UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO(o);
     instID = _OrderBuffer[instID];
@@ -214,6 +303,15 @@ v2f vert(uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
     cov3d1 *= splatScale2;
 
     float3 cov2d = CalcCovariance2D(splat.pos, cov3d0, cov3d1, UNITY_MATRIX_MV, UNITY_MATRIX_P, _ScreenParams);
+#if defined(UNITY_STEREO_INSTANCING_ENABLED) || defined(UNITY_STEREO_MULTIVIEW_ENABLED)
+    // CalcCovariance2D uses the X focal length for both Jacobian rows.
+    // Convert its Y row to this eye's signed Y focal length, retaining the
+    // isotropic 0.3-pixel low-pass term added by that function.
+    float focalRatio = (_ScreenParams.y * UNITY_MATRIX_P._m11) /
+        (_ScreenParams.x * UNITY_MATRIX_P._m00);
+    cov2d.y *= focalRatio;
+    cov2d.z = (cov2d.z - 0.3) * focalRatio * focalRatio + 0.3;
+#endif
     float2 axis1, axis2;
     DecomposeCovarianceForVertex(cov2d, axis1, axis2);
 
@@ -228,6 +326,14 @@ v2f vert(uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
     float2 deltaScreenPos = (quadPos.x * axis1 + quadPos.y * axis2) * 2 / _ScreenParams.xy;
     o.vertex = centerClipPos;
     o.vertex.xy += deltaScreenPos * centerClipPos.w;
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+    // Recover the camera-facing billboard offset using this eye's projection.
+    // Do this before the existing render-target Y flip.
+    float2 viewOffset = deltaScreenPos * centerClipPos.w /
+        float2(UNITY_MATRIX_P._m00, UNITY_MATRIX_P._m11);
+    o.environmentWorldPos = centerWorldPos +
+        mul((float3x3)UNITY_MATRIX_I_V, float3(viewOffset, 0.0));
+#endif
     if (_GaussianSplatClipFlipY > 0.5)
         o.vertex.y = -o.vertex.y;
 
@@ -243,7 +349,16 @@ v2f vert(uint vtxID : SV_VertexID, uint instID : SV_InstanceID)
     return o;
 }
 
+#if defined(GSAC_ENV_VISIBILITY_CAP)
+struct GsacFragmentOutput
+{
+    half4 color : SV_Target0;
+    float visibility : SV_Target1;
+};
+GsacFragmentOutput frag(v2f i)
+#else
 half4 frag(v2f i) : SV_Target
+#endif
 {
     UNITY_SETUP_STEREO_EYE_INDEX_POST_VERTEX(i);
     float power = -dot(i.pos, i.pos);
@@ -270,7 +385,30 @@ half4 frag(v2f i) : SV_Target
     if (alpha < 1.0/255.0)
         discard;
 
-    return half4(i.col.rgb * alpha, alpha);
+    half4 res = half4(i.col.rgb * alpha, alpha);
+#if defined(GSAC_ENV_VISIBILITY_CAP)
+    float gsacVisibility = 1.0;
+#endif
+#if defined(HARD_OCCLUSION) || defined(SOFT_OCCLUSION)
+#if defined(GSAC_ENV_VISIBILITY_CAP)
+    // Reuse the same sample for color attenuation and a separate visibility
+    // envelope. The envelope must not become opaque as splats accumulate.
+    gsacVisibility = CalculateEnvironmentDepthOcclusion(i.environmentWorldPos, _GsacEnvironmentDepthBias);
+    if (gsacVisibility < 0.01)
+        discard;
+    res *= gsacVisibility;
+#else
+    META_DEPTH_OCCLUDE_OUTPUT_PREMULTIPLY_WORLDPOS(i.environmentWorldPos, res, _GsacEnvironmentDepthBias);
+#endif
+#endif
+#if defined(GSAC_ENV_VISIBILITY_CAP)
+    GsacFragmentOutput output;
+    output.color = res;
+    output.visibility = gsacVisibility;
+    return output;
+#else
+    return res;
+#endif
 }
 ENDCG
         }
