@@ -39,3 +39,7 @@
 *.reason filter=lfs diff=lfs merge=lfs -text
 *.lxo filter=lfs diff=lfs merge=lfs -text
 
+# Reproducible rd_pipeline_0721 source avatar inputs
+Assets/HahaData/state_dict_rd_pipeline_0721.json filter=lfs diff=lfs merge=lfs -text
+Assets/HahaData/rd_pipeline_0721.ply filter=lfs diff=lfs merge=lfs -text
+
