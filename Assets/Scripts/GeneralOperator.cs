@@ -15,12 +15,14 @@ public sealed class GeneralOperator : MonoBehaviour
     [SerializeField] bool showHeadsetFps = false;
     [SerializeField] bool runPerformanceProtocol = false;
     [SerializeField] bool useQuestEnvironmentDepth = false;
+    [SerializeField] bool useQuestTrackedHandOcclusion = true;
 
     public bool BuildVR => buildVR;
     public bool BuildAR => buildAR;
     public bool ShowHeadsetFps => showHeadsetFps;
     public bool RunPerformanceProtocol => runPerformanceProtocol;
     public bool UseQuestEnvironmentDepth => useQuestEnvironmentDepth;
+    public bool UseQuestTrackedHandOcclusion => useQuestTrackedHandOcclusion;
     public GeneralBuildMode Mode => buildAR ? GeneralBuildMode.AR : GeneralBuildMode.VR;
 
     public void SetMode(GeneralBuildMode mode)
@@ -53,6 +55,13 @@ public sealed class GeneralOperator : MonoBehaviour
         var generalOperator = FindObjectOfType<GeneralOperator>(true);
         return generalOperator != null && generalOperator.Mode == GeneralBuildMode.AR &&
                generalOperator.UseQuestEnvironmentDepth;
+    }
+
+    public static bool GetSceneTrackedHandOcclusionEnabled()
+    {
+        var generalOperator = FindObjectOfType<GeneralOperator>(true);
+        return generalOperator != null && generalOperator.Mode == GeneralBuildMode.AR &&
+               generalOperator.UseQuestEnvironmentDepth && generalOperator.UseQuestTrackedHandOcclusion;
     }
 
     void Reset()

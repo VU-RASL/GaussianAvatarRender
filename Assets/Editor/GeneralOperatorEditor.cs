@@ -25,6 +25,7 @@ public sealed class GeneralOperatorEditor : Editor
     SerializedProperty showHeadsetFps;
     SerializedProperty runPerformanceProtocol;
     SerializedProperty useQuestEnvironmentDepth;
+    SerializedProperty useQuestTrackedHandOcclusion;
 
     void OnEnable()
     {
@@ -33,6 +34,7 @@ public sealed class GeneralOperatorEditor : Editor
         showHeadsetFps = serializedObject.FindProperty("showHeadsetFps");
         runPerformanceProtocol = serializedObject.FindProperty("runPerformanceProtocol");
         useQuestEnvironmentDepth = serializedObject.FindProperty("useQuestEnvironmentDepth");
+        useQuestTrackedHandOcclusion = serializedObject.FindProperty("useQuestTrackedHandOcclusion");
     }
 
     public override void OnInspectorGUI()
@@ -78,6 +80,13 @@ public sealed class GeneralOperatorEditor : Editor
                 "Placement uses the XR floor height rather than detected AR planes. " +
                 "Selects Multiview, which the Oculus environment depth provider requires. " +
                 "Verify both eyes and performance on the headset."));
+            using (new EditorGUI.DisabledScope(!useQuestEnvironmentDepth.boolValue))
+            {
+                EditorGUILayout.PropertyField(useQuestTrackedHandOcclusion, new GUIContent(
+                    "Use tracked hands for occlusion",
+                    "Uses hand meshes while both hands are confidently tracked. Falls back to environment depth " +
+                    "when either hand loses tracking or a controller is used. Hand contours can differ from passthrough."));
+            }
         }
         if (buildAR.boolValue && useQuestEnvironmentDepth.boolValue)
         {

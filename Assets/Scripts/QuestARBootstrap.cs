@@ -29,6 +29,8 @@ public sealed class QuestARBootstrap : MonoBehaviour
     OVRCameraRig depthCameraRig;
     OVRManager ovrManager;
     EnvironmentDepthManager depthManager;
+    QuestTrackedHandOcclusion trackedHands;
+    bool trackedHandsRequested;
     Transform trackingSpaceSource;
     bool useOculusProfile;
     bool depthRequested;
@@ -51,6 +53,8 @@ public sealed class QuestARBootstrap : MonoBehaviour
     }
 
     public bool EnvironmentDepthEnabled => depthRequested;
+    public bool TrackedHandOcclusionEnabled => trackedHandsRequested;
+    public bool TrackedHandOcclusionActive => trackedHands != null && trackedHands.IsReplacementActive;
     public bool EnvironmentDepthAvailable => CanUseDepthNow && depthManager != null && depthManager.IsDepthAvailable;
     bool CanUseDepthNow => isARMode && useOculusProfile && depthRequested &&
                            !applicationPaused && applicationFocused;
@@ -188,6 +192,8 @@ public sealed class QuestARBootstrap : MonoBehaviour
             RestoreEyeAlphaMode();
         depthRequested = useOculusProfile && (preserveDepthRequest
             ? depthRequested : GeneralOperator.GetSceneEnvironmentDepthEnabled());
+        if (!preserveDepthRequest)
+            trackedHandsRequested = GeneralOperator.GetSceneTrackedHandOcclusionEnabled();
         Shader.SetGlobalFloat(s_DepthBiasId, 0.0f);
         if (useOculusProfile)
             DisableARFoundationManagers();
@@ -437,6 +443,36 @@ public sealed class QuestARBootstrap : MonoBehaviour
         Debug.Log(depthRequested ? "GSAC environment depth enabled." : "GSAC environment depth disabled for A/B comparison.");
     }
 
+    // Also permits a matched hand-only comparison without restarting the depth provider.
+    public void SetTrackedHandOcclusionEnabled(bool enabled)
+    {
+        trackedHandsRequested = enabled;
+        RefreshTrackedHands();
+    }
+
+    void RefreshTrackedHands()
+    {
+        if (!trackedHandsRequested || depthManager == null || !CanUseDepthNow)
+        {
+            ReleaseTrackedHands();
+            return;
+        }
+        if (trackedHands != null)
+            return;
+        trackedHands = depthManager.gameObject.AddComponent<QuestTrackedHandOcclusion>();
+        if (!trackedHands.Initialize(depthManager, depthCameraRig))
+            ReleaseTrackedHands();
+    }
+
+    void ReleaseTrackedHands()
+    {
+        if (trackedHands == null)
+            return;
+        trackedHands.Shutdown();
+        Destroy(trackedHands);
+        trackedHands = null;
+    }
+
     void RefreshDepthLifecycle()
     {
         if (!CanUseDepthNow || !isActiveAndEnabled)
@@ -507,10 +543,12 @@ public sealed class QuestARBootstrap : MonoBehaviour
         reportedDepthTimeout = false;
         depthStartRoutine = null;
         RequestScenePermissionIfNeeded();
+        RefreshTrackedHands();
     }
 
     void ReleaseDepthManager()
     {
+        ReleaseTrackedHands();
         if (depthStartRoutine != null)
         {
             StopCoroutine(depthStartRoutine);
