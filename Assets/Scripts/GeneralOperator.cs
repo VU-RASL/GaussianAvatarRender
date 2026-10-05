@@ -16,6 +16,7 @@ public sealed class GeneralOperator : MonoBehaviour
     [SerializeField] bool runPerformanceProtocol = false;
     [SerializeField] bool useQuestEnvironmentDepth = false;
     [SerializeField] bool useQuestTrackedHandOcclusion = true;
+    [SerializeField] bool useQuestShoulderTouchPose = false;
 
     public bool BuildVR => buildVR;
     public bool BuildAR => buildAR;
@@ -23,6 +24,7 @@ public sealed class GeneralOperator : MonoBehaviour
     public bool RunPerformanceProtocol => runPerformanceProtocol;
     public bool UseQuestEnvironmentDepth => useQuestEnvironmentDepth;
     public bool UseQuestTrackedHandOcclusion => useQuestTrackedHandOcclusion;
+    public bool UseQuestShoulderTouchPose => useQuestShoulderTouchPose;
     public GeneralBuildMode Mode => buildAR ? GeneralBuildMode.AR : GeneralBuildMode.VR;
 
     public void SetMode(GeneralBuildMode mode)
@@ -62,6 +64,13 @@ public sealed class GeneralOperator : MonoBehaviour
         var generalOperator = FindObjectOfType<GeneralOperator>(true);
         return generalOperator != null && generalOperator.Mode == GeneralBuildMode.AR &&
                generalOperator.UseQuestEnvironmentDepth && generalOperator.UseQuestTrackedHandOcclusion;
+    }
+
+    public static bool GetSceneShoulderTouchPoseEnabled()
+    {
+        var generalOperator = FindObjectOfType<GeneralOperator>(true);
+        return generalOperator != null && generalOperator.Mode == GeneralBuildMode.AR &&
+               generalOperator.UseQuestShoulderTouchPose;
     }
 
     void Reset()

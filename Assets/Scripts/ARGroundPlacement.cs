@@ -1,6 +1,8 @@
 using System.Collections.Generic;
+using GaussianSplatting.Runtime;
 using Unity.XR.CoreUtils;
 using UnityEngine;
+using UnityEngine.XR;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
 
@@ -10,6 +12,7 @@ public sealed class ARGroundPlacement : MonoBehaviour
     [SerializeField] Camera arCamera;
     [SerializeField] Transform[] extraGroundedObjects;
     [SerializeField] float distanceInFrontOfCamera = 2.0f;
+    [SerializeField, Range(0.6f, 1.2f)] float shoulderTouchDistanceInMeters = 0.8f;
     [SerializeField] float floorHeightOffset;
     [SerializeField] float estimatedHeadHeight = 1.6f;
     [SerializeField] float retrySeconds = 8.0f;
@@ -28,6 +31,14 @@ public sealed class ARGroundPlacement : MonoBehaviour
     bool placedOnDetectedGround;
     bool useXRTrackingFloor;
     bool isARMode;
+    bool useTouchPlacement;
+    float headTrackedSince = -1;
+    float nextTouchAnchorAttempt;
+    InputDevice headDevice;
+    PoseController touchPose;
+    Transform touchMesh, touchGaussian, touchLeftShoulder, touchRightShoulder;
+
+    public bool ReadyForShoulderTouch => !useTouchPlacement || placedOnce;
 
     void OnEnable()
     {
@@ -37,6 +48,12 @@ public sealed class ARGroundPlacement : MonoBehaviour
         placedOnDetectedGround = false;
         isARMode = GeneralOperator.GetSceneMode() == GeneralBuildMode.AR;
         useXRTrackingFloor = QuestARBootstrap.IsOculusLoaderConfigured();
+        useTouchPlacement = isARMode && useXRTrackingFloor && GeneralOperator.GetSceneShoulderTouchPoseEnabled();
+        headTrackedSince = -1;
+        nextTouchAnchorAttempt = 0;
+        touchPose = null;
+        touchMesh = touchGaussian = touchLeftShoulder = touchRightShoulder = null;
+        headDevice = InputDevices.GetDeviceAtXRNode(XRNode.Head);
         EnsureReferences();
         PlaceAvatarOnGround();
     }
@@ -46,7 +63,7 @@ public sealed class ARGroundPlacement : MonoBehaviour
         if (!isARMode)
             return;
 
-        if (placedOnDetectedGround)
+        if (placedOnDetectedGround || (useTouchPlacement && placedOnce))
             return;
 
         if (placedOnce && Time.time - startTime > retrySeconds)
@@ -120,6 +137,8 @@ public sealed class ARGroundPlacement : MonoBehaviour
     {
         if (avatarRoot == null || arCamera == null)
             return;
+        if (useTouchPlacement && (placedOnce || !CanPlaceTouchAvatar()))
+            return;
 
         Vector3 cameraForward = Vector3.ProjectOnPlane(arCamera.transform.forward, Vector3.up);
         if (cameraForward.sqrMagnitude < 0.001f)
@@ -128,7 +147,8 @@ public sealed class ARGroundPlacement : MonoBehaviour
             cameraForward = Vector3.forward;
         cameraForward.Normalize();
 
-        Vector3 target = arCamera.transform.position + cameraForward * distanceInFrontOfCamera;
+        float distance = useTouchPlacement ? Mathf.Clamp(shoulderTouchDistanceInMeters, 0.6f, 1.2f) : distanceInFrontOfCamera;
+        Vector3 target = arCamera.transform.position + cameraForward * distance;
         bool foundGround = TryGetDetectedGround(target, out float groundY);
         if (!foundGround)
             groundY = EstimateFallbackGroundY();
@@ -140,11 +160,64 @@ public sealed class ARGroundPlacement : MonoBehaviour
         float placementGroundY = groundY + floorHeightOffset;
         avatarRoot.SetPositionAndRotation(new Vector3(target.x, placementGroundY, target.z), rotation);
         AlignRendererBoundsToGround(avatarRoot, placementGroundY);
+        if (useTouchPlacement)
+        {
+            // The visible Gaussian body is offset from Avatar's root. Align its
+            // actual shoulder midpoint after yaw and floor placement.
+            Vector3 center = QuestAvatarShoulderTouch.MapMeshWorldPointToGaussianWorld(
+                touchMesh, touchGaussian, (touchLeftShoulder.position + touchRightShoulder.position) * 0.5f);
+            Vector3 correction = target - center;
+            correction.y = 0;
+            avatarRoot.position += correction;
+            Debug.Log("GSAC shoulder placement: visible shoulders centered " + distance.ToString("F2") +
+                      " m ahead; world position locked.", this);
+        }
         AlignExtraObjectsToGround(placementGroundY);
         placedOnce = true;
         placedOnDetectedGround |= foundGround;
         if (placedOnDetectedGround && !keepGroundDetectionRunning)
             StopGroundDetection();
+    }
+
+    bool CanPlaceTouchAvatar()
+    {
+        if (!headDevice.isValid) headDevice = InputDevices.GetDeviceAtXRNode(XRNode.Head);
+        bool tracked = Application.isFocused && headDevice.isValid &&
+            headDevice.TryGetFeatureValue(CommonUsages.userPresence, out bool present) && present &&
+            headDevice.TryGetFeatureValue(CommonUsages.isTracked, out bool isTracked) && isTracked;
+        if (!tracked)
+        {
+            headTrackedSince = -1;
+            return false;
+        }
+        if (headTrackedSince < 0) headTrackedSince = Time.unscaledTime;
+        if (Time.unscaledTime - headTrackedSince < 0.35f)
+            return false;
+
+        if (touchPose == null || touchMesh == null || touchGaussian == null ||
+            touchLeftShoulder == null || touchRightShoulder == null)
+        {
+            if (Time.unscaledTime < nextTouchAnchorAttempt) return false;
+            nextTouchAnchorAttempt = Time.unscaledTime + 0.5f;
+            touchPose = avatarRoot.GetComponentInChildren<PoseController>();
+            if (touchPose == null || touchPose.smplx == null ||
+                touchPose.vertexBuffer == null || !touchPose.vertexBuffer.IsValid())
+                return false;
+            var vertices = touchPose.GetCurrentVertices();
+            if (vertices == null || vertices.Length == 0) return false;
+            var mesh = touchPose.smplx.GetComponentInChildren<SkinnedMeshRenderer>();
+            var gaussian = touchPose.GetComponent<GaussianSplatRenderer>();
+            if (mesh == null || gaussian == null) return false;
+            touchMesh = mesh.transform;
+            touchGaussian = gaussian.transform;
+            foreach (var bone in touchPose.smplx.GetComponentsInChildren<Transform>(true))
+            {
+                if (bone.name == "left_shoulder") touchLeftShoulder = bone;
+                else if (bone.name == "right_shoulder") touchRightShoulder = bone;
+            }
+        }
+        return touchMesh != null && touchGaussian != null &&
+               touchLeftShoulder != null && touchRightShoulder != null;
     }
 
     void StopGroundDetection()

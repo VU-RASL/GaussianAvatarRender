@@ -26,6 +26,7 @@ public sealed class GeneralOperatorEditor : Editor
     SerializedProperty runPerformanceProtocol;
     SerializedProperty useQuestEnvironmentDepth;
     SerializedProperty useQuestTrackedHandOcclusion;
+    SerializedProperty useQuestShoulderTouchPose;
 
     void OnEnable()
     {
@@ -35,6 +36,7 @@ public sealed class GeneralOperatorEditor : Editor
         runPerformanceProtocol = serializedObject.FindProperty("runPerformanceProtocol");
         useQuestEnvironmentDepth = serializedObject.FindProperty("useQuestEnvironmentDepth");
         useQuestTrackedHandOcclusion = serializedObject.FindProperty("useQuestTrackedHandOcclusion");
+        useQuestShoulderTouchPose = serializedObject.FindProperty("useQuestShoulderTouchPose");
     }
 
     public override void OnInspectorGUI()
@@ -96,6 +98,15 @@ public sealed class GeneralOperatorEditor : Editor
                 "the depth provider cannot produce depth frames in Multi Pass. Check both eyes and compare headset " +
                 "performance before relying on it. Turn this off and rebuild to return to the OpenXR baseline.",
                 MessageType.Warning);
+        }
+
+        EditorGUILayout.Space();
+        EditorGUILayout.LabelField("Avatar Interaction", EditorStyles.boldLabel);
+        using (new EditorGUI.DisabledScope(!buildAR.boolValue || !useQuestEnvironmentDepth.boolValue || EditorApplication.isPlaying))
+        {
+            EditorGUILayout.PropertyField(useQuestShoulderTouchPose, new GUIContent(
+                "Touch shoulder to start Pose 1",
+                "Starts in No Pose. Either tracked hand can touch either shoulder to start the existing Pose 1 animation once per run. Uses the Oculus AR profile."));
         }
 
         if (serializedObject.ApplyModifiedProperties())

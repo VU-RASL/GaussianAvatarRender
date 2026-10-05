@@ -30,6 +30,7 @@ public sealed class QuestARBootstrap : MonoBehaviour
     OVRManager ovrManager;
     EnvironmentDepthManager depthManager;
     QuestTrackedHandOcclusion trackedHands;
+    QuestAvatarShoulderTouch shoulderTouch;
     bool trackedHandsRequested;
     Transform trackingSpaceSource;
     bool useOculusProfile;
@@ -106,6 +107,7 @@ public sealed class QuestARBootstrap : MonoBehaviour
 #if UNITY_ANDROID && !UNITY_EDITOR
         SceneManager.sceneLoaded -= OnSceneLoaded;
 #endif
+        ReleaseShoulderTouch();
         ReleaseDepthManager();
         RestoreEyeAlphaMode();
     }
@@ -179,6 +181,7 @@ public sealed class QuestARBootstrap : MonoBehaviour
         isARMode = GeneralOperator.GetSceneMode() == GeneralBuildMode.AR;
         if (!isARMode)
         {
+            ReleaseShoulderTouch();
             RestoreEyeAlphaMode();
             SetEnvironmentDepthEnabled(false);
             if (depthRuntimeRoot != null)
@@ -240,6 +243,7 @@ public sealed class QuestARBootstrap : MonoBehaviour
                 yield break;
             }
             SyncTrackingSpace();
+            ConfigureShoulderTouch();
 
             ApplyDepthOcclusionShaderToOrdinaryObjects();
             RefreshDepthLifecycle();
@@ -441,6 +445,48 @@ public sealed class QuestARBootstrap : MonoBehaviour
         if (!TryResumeSceneSetup())
             RefreshDepthLifecycle();
         Debug.Log(depthRequested ? "GSAC environment depth enabled." : "GSAC environment depth disabled for A/B comparison.");
+    }
+
+    void ConfigureShoulderTouch()
+    {
+        if (!GeneralOperator.GetSceneShoulderTouchPoseEnabled())
+        {
+            ReleaseShoulderTouch();
+            return;
+        }
+        // Owned by the avatar: depth-provider restarts must not reset this interaction.
+        if (shoulderTouch != null)
+            return;
+        PoseController avatar = null;
+        foreach (var candidate in FindObjectsOfType<PoseController>())
+        {
+            if (!candidate.isActiveAndEnabled || candidate.smplx == null ||
+                !candidate.smplx.gameObject.activeInHierarchy)
+                continue;
+            if (avatar != null)
+            {
+                Debug.LogWarning("GSAC shoulder touch requires exactly one active avatar; interaction was not started.");
+                return;
+            }
+            avatar = candidate;
+        }
+        if (avatar == null)
+        {
+            Debug.LogWarning("GSAC shoulder touch could not find an active avatar.");
+            return;
+        }
+        shoulderTouch = avatar.gameObject.AddComponent<QuestAvatarShoulderTouch>();
+        if (!shoulderTouch.Initialize(avatar, depthCameraRig))
+            ReleaseShoulderTouch();
+    }
+
+    void ReleaseShoulderTouch()
+    {
+        if (shoulderTouch == null)
+            return;
+        shoulderTouch.Shutdown();
+        Destroy(shoulderTouch);
+        shoulderTouch = null;
     }
 
     // Also permits a matched hand-only comparison without restarting the depth provider.
