@@ -8,6 +8,10 @@ using Unity.Mathematics;
 // [ExecuteInEditMode]
 public class PoseController : MonoBehaviour
 {   
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+    public static long QuestBakeTicks;
+    public static int QuestBakeCount;
+#endif
     public Transform debug;
 
 
@@ -861,6 +865,9 @@ public class PoseController : MonoBehaviour
             return;
         }
 
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+        long bakeStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+#endif
         smr.updateWhenOffscreen = true;
         smr.BakeMesh(bakedMesh);
 
@@ -903,6 +910,10 @@ public class PoseController : MonoBehaviour
         {
             Debug.LogError("Vertex buffer is not initialized!");
         }
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+        QuestBakeTicks += System.Diagnostics.Stopwatch.GetTimestamp() - bakeStarted;
+        ++QuestBakeCount;
+#endif
 
 
 

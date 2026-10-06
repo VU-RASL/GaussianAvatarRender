@@ -11,6 +11,8 @@ using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 using UnityEngine.XR;
 using System.IO;
+using Unity.Burst;
+using Unity.Jobs;
 
 namespace GaussianSplatting.Runtime
 {
@@ -194,7 +196,7 @@ namespace GaussianSplatting.Runtime
                 //     Debug.Log(gs_xyz[0]);
                 
                 
-                gs.m_TBuffer.SetData(gs.T);
+                // The unused centroid buffer is initialized once with the asset.
  
                 // Debug.Log(gs.T[0]);
                 mpb.SetBuffer("_TBuffer",gs.m_TBuffer); 
@@ -640,6 +642,10 @@ namespace GaussianSplatting.Runtime
     [ExecuteInEditMode]
     public class GaussianSplatRenderer : MonoBehaviour
     {
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+        public static long QuestSortTicks;
+        public static int QuestSortCount;
+#endif
         [UnityEngine.Scripting.Preserve]
         public static bool EnvironmentVisibilityCapSupported => GaussianSplatRenderSystem.EnvironmentVisibilityCapSupported;
         [UnityEngine.Scripting.Preserve]
@@ -651,6 +657,16 @@ namespace GaussianSplatting.Runtime
         Vector3[] m_CpuSortPositions;
         float[] m_CpuSortDistances;
         uint[] m_CpuSortKeys;
+        [SerializeField] bool m_UseOptimizedCpuSort = true;
+        public bool UseOptimizedCpuSort
+        {
+            get => m_UseOptimizedCpuSort;
+            set => m_UseOptimizedCpuSort = value;
+        }
+
+        NativeArray<CpuDepthSortItem> m_NativeCpuSortItems;
+        NativeArray<uint> m_NativeCpuSortKeys;
+        bool m_OptimizedCpuSortFailureLogged;
 
         public void SetUpdatedPositionsBuffer(GraphicsBuffer buffer)
         {
@@ -664,11 +680,13 @@ namespace GaussianSplatting.Runtime
             {
                 m_CpuSortDistances = null;
                 m_CpuSortKeys = null;
+                DisposeNativeCpuSortData();
                 return;
             }
 
             if (m_CpuSortDistances == null || m_CpuSortDistances.Length != positions.Length)
             {
+                DisposeNativeCpuSortData();
                 m_CpuSortDistances = new float[positions.Length];
                 m_CpuSortKeys = new uint[positions.Length];
             }
@@ -1102,6 +1120,7 @@ namespace GaussianSplatting.Runtime
 
         void DisposeResourcesForAsset()
         {
+            DisposeNativeCpuSortData();
             DestroyImmediate(m_GpuColorData);
 
             DisposeBuffer(ref m_GpuPosData);
@@ -1279,15 +1298,247 @@ namespace GaussianSplatting.Runtime
             if (count <= 0)
                 return;
 
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            long sortStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+#endif
+            bool optimized = m_UseOptimizedCpuSort && TrySortPointsCpuOptimized(matrixMV, count);
+            if (optimized)
+            {
+                m_GpuSortKeys.SetData(m_NativeCpuSortKeys, 0, 0, count);
+            }
+            else
+            {
+                ComputeCpuSortReference(m_CpuSortPositions, matrixMV, m_CpuSortDistances, m_CpuSortKeys, count);
+                m_GpuSortKeys.SetData(m_CpuSortKeys, 0, 0, count);
+            }
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            QuestSortTicks += System.Diagnostics.Stopwatch.GetTimestamp() - sortStarted;
+            ++QuestSortCount;
+#endif
+        }
+
+        bool TrySortPointsCpuOptimized(Matrix4x4 matrixMV, int count)
+        {
+            try
+            {
+                EnsureNativeCpuSortData(count);
+                FillCpuDepthSortItems(m_CpuSortPositions, matrixMV, m_NativeCpuSortItems);
+                new CpuDepthSortJob
+                {
+                    items = m_NativeCpuSortItems,
+                    keys = m_NativeCpuSortKeys
+                }.Schedule().Complete();
+                return true;
+            }
+            catch (Exception exception)
+            {
+                if (!m_OptimizedCpuSortFailureLogged)
+                {
+                    Debug.LogWarning("Quest Burst CPU sort failed; using the existing sort. " +
+                        exception.GetType().Name + ": " + exception.Message, this);
+                    m_OptimizedCpuSortFailureLogged = true;
+                }
+                m_UseOptimizedCpuSort = false;
+                DisposeNativeCpuSortData();
+                return false;
+            }
+        }
+
+        void EnsureNativeCpuSortData(int count)
+        {
+            if (m_NativeCpuSortItems.IsCreated && m_NativeCpuSortItems.Length == count)
+                return;
+
+            DisposeNativeCpuSortData();
+            try
+            {
+                m_NativeCpuSortItems = new NativeArray<CpuDepthSortItem>(count, Allocator.Persistent,
+                    NativeArrayOptions.UninitializedMemory);
+                m_NativeCpuSortKeys = new NativeArray<uint>(count, Allocator.Persistent,
+                    NativeArrayOptions.UninitializedMemory);
+            }
+            catch
+            {
+                DisposeNativeCpuSortData();
+                throw;
+            }
+        }
+
+        void DisposeNativeCpuSortData()
+        {
+            if (m_NativeCpuSortItems.IsCreated) m_NativeCpuSortItems.Dispose();
+            if (m_NativeCpuSortKeys.IsCreated) m_NativeCpuSortKeys.Dispose();
+        }
+
+        static void ComputeCpuSortReference(Vector3[] positions, Matrix4x4 matrixMV,
+            float[] depths, uint[] keys, int count)
+        {
             for (int i = 0; i < count; ++i)
             {
-                m_CpuSortDistances[i] = matrixMV.MultiplyPoint3x4(m_CpuSortPositions[i]).z;
-                m_CpuSortKeys[i] = (uint)i;
+                depths[i] = matrixMV.MultiplyPoint3x4(positions[i]).z;
+                keys[i] = (uint)i;
+            }
+            Array.Sort(depths, keys, 0, count);
+        }
+
+        static void FillCpuDepthSortItems(Vector3[] positions, Matrix4x4 matrixMV,
+            NativeArray<CpuDepthSortItem> items)
+        {
+            // Keep the original managed depth calculation so near-equal values retain their rank.
+            for (int i = 0; i < items.Length; ++i)
+            {
+                items[i] = new CpuDepthSortItem
+                {
+                    depth = matrixMV.MultiplyPoint3x4(positions[i]).z,
+                    index = (uint)i
+                };
+            }
+        }
+
+        struct CpuDepthSortItem
+        {
+            public float depth;
+            public uint index;
+        }
+
+        struct CpuDepthComparer : IComparer<CpuDepthSortItem>
+        {
+            public int Compare(CpuDepthSortItem a, CpuDepthSortItem b)
+            {
+                // Match Single.CompareTo: NaN precedes numeric values; signed zeros compare equal.
+                if (a.depth < b.depth) return -1;
+                if (a.depth > b.depth) return 1;
+                if (a.depth == b.depth) return 0;
+                if (math.isnan(a.depth)) return math.isnan(b.depth) ? 0 : -1;
+                return 1;
+            }
+        }
+
+        [BurstCompile(FloatMode = FloatMode.Strict, CompileSynchronously = true)]
+        struct CpuDepthSortJob : IJob
+        {
+            public NativeArray<CpuDepthSortItem> items;
+            [WriteOnly] public NativeArray<uint> keys;
+
+            public void Execute()
+            {
+                items.Sort(new CpuDepthComparer());
+                for (int i = 0; i < items.Length; ++i)
+                    keys[i] = items[i].index;
+            }
+        }
+
+#if UNITY_EDITOR
+        // Editor-only harness: use the production persistent buffers and sort implementation
+        // without registering a renderer or allocating GPU resources.
+        public sealed class CpuSortBenchmarkContext : IDisposable
+        {
+            readonly GameObject owner;
+            GaussianSplatRenderer renderer;
+
+            public CpuSortBenchmarkContext(Vector3[] positions)
+            {
+                owner = new GameObject("GSAC CPU sort benchmark") { hideFlags = HideFlags.HideAndDontSave };
+                owner.SetActive(false);
+                renderer = owner.AddComponent<GaussianSplatRenderer>();
+                renderer.SetCpuSortPositions(positions);
             }
 
-            Array.Sort(m_CpuSortDistances, m_CpuSortKeys, 0, count);
-            m_GpuSortKeys.SetData(m_CpuSortKeys, 0, 0, count);
+            public bool HasNativeBuffers => renderer != null &&
+                (renderer.m_NativeCpuSortItems.IsCreated || renderer.m_NativeCpuSortKeys.IsCreated);
+            public int NativeBufferLength => renderer != null && renderer.m_NativeCpuSortItems.IsCreated
+                ? renderer.m_NativeCpuSortItems.Length : 0;
+
+            public void SetPositions(Vector3[] positions)
+            {
+                RequireRenderer();
+                renderer.SetCpuSortPositions(positions);
+            }
+
+            public void RunReference(Matrix4x4 matrixMV)
+            {
+                RequirePositions();
+                ComputeCpuSortReference(renderer.m_CpuSortPositions, matrixMV,
+                    renderer.m_CpuSortDistances, renderer.m_CpuSortKeys, renderer.m_CpuSortPositions.Length);
+            }
+
+            public void RunOptimized(Matrix4x4 matrixMV)
+            {
+                RequirePositions();
+                if (!renderer.TrySortPointsCpuOptimized(matrixMV, renderer.m_CpuSortPositions.Length))
+                    throw new InvalidOperationException("The production optimized CPU sort used its fallback.");
+            }
+
+            public void CopyReferenceResults(float[] depths, uint[] keys)
+            {
+                RequirePositions();
+                Array.Copy(renderer.m_CpuSortDistances, depths, renderer.m_CpuSortDistances.Length);
+                Array.Copy(renderer.m_CpuSortKeys, keys, renderer.m_CpuSortKeys.Length);
+            }
+
+            public void CopyOptimizedResults(float[] depths, uint[] keys)
+            {
+                RequirePositions();
+                renderer.m_NativeCpuSortKeys.CopyTo(keys);
+                for (int i = 0; i < renderer.m_NativeCpuSortItems.Length; ++i)
+                    depths[i] = renderer.m_NativeCpuSortItems[i].depth;
+            }
+
+            public void ExerciseDisableEnableCallbacks()
+            {
+                RequireRenderer();
+                // The hidden owner stays inactive. These are the real production cleanup callbacks.
+                renderer.OnDisable();
+                if (HasNativeBuffers)
+                    throw new InvalidOperationException("CPU sort buffers survived OnDisable.");
+                renderer.OnEnable();
+            }
+
+            void RequireRenderer()
+            {
+                if (renderer == null) throw new ObjectDisposedException(nameof(CpuSortBenchmarkContext));
+            }
+
+            void RequirePositions()
+            {
+                RequireRenderer();
+                if (renderer.m_CpuSortPositions == null)
+                    throw new InvalidOperationException("CPU sort positions are not assigned.");
+            }
+
+            public void Dispose()
+            {
+                if (renderer == null) return;
+                renderer.SetCpuSortPositions(null);
+                UnityEngine.Object.DestroyImmediate(owner);
+                renderer = null;
+            }
         }
+
+        public static void ComputeCpuSortReferenceForValidation(Vector3[] positions, Matrix4x4 matrixMV,
+            float[] sortedDepths, uint[] sortedKeys)
+        {
+            ComputeCpuSortReference(positions, matrixMV, sortedDepths, sortedKeys, positions.Length);
+        }
+
+        public static void ComputeCpuSortBurstForValidation(Vector3[] positions, Matrix4x4 matrixMV,
+            float[] sortedDepths, uint[] sortedKeys)
+        {
+            using (var nativeItems = new NativeArray<CpuDepthSortItem>(positions.Length, Allocator.TempJob))
+            using (var nativeKeys = new NativeArray<uint>(positions.Length, Allocator.TempJob))
+            {
+                FillCpuDepthSortItems(positions, matrixMV, nativeItems);
+                new CpuDepthSortJob
+                {
+                    items = nativeItems,
+                    keys = nativeKeys
+                }.Schedule().Complete();
+                nativeKeys.CopyTo(sortedKeys);
+                for (int i = 0; i < nativeItems.Length; ++i)
+                    sortedDepths[i] = nativeItems[i].depth;
+            }
+        }
+#endif
 
         public void Update()
         {

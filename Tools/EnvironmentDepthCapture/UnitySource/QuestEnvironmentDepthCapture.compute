@@ -1,0 +1,12 @@
+// Disabled by default: outside Unity Assets. Imported only for an explicit diagnostic build.
+#pragma kernel CopyDepth
+Texture2DArray<float> _CaptureSource;
+RWStructuredBuffer<float> _CaptureValues;
+int _CaptureWidth;
+int _CaptureHeight;
+[numthreads(8,8,1)]
+void CopyDepth(uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= (uint)_CaptureWidth || id.y >= (uint)_CaptureHeight) return;
+    _CaptureValues[id.y * _CaptureWidth + id.x] = _CaptureSource.Load(int4(id.xy, 0, 0));
+}

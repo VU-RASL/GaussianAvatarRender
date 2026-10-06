@@ -3,6 +3,12 @@ using GaussianSplatting.Runtime;
 using System;
 using Unity.Mathematics;
 using System.IO;
+using Unity.Burst;
+using Unity.Collections;
+using Unity.Collections.LowLevel.Unsafe;
+using Unity.Jobs;
+using Unity.Profiling;
+using Stopwatch = System.Diagnostics.Stopwatch;
 
 [DefaultExecutionOrder(100)]
 public class TestShaderWithBuffer : MonoBehaviour
@@ -16,6 +22,22 @@ public class TestShaderWithBuffer : MonoBehaviour
     [SerializeField] private GaussianSplatRenderer gaussianRenderer;
     [SerializeField] private bool forceCpuSplatUpdate;
     [SerializeField, Range(1, 4)] private int questCpuUpdateInterval = 2;
+    [SerializeField] private bool useOptimizedQuestCpuUpdate = true;
+
+    public bool UseOptimizedQuestCpuUpdate
+    {
+        get => useOptimizedQuestCpuUpdate;
+        set => useOptimizedQuestCpuUpdate = value;
+    }
+
+    public static long QuestComputeTicks;
+    public static long QuestUploadTicks;
+    public static int QuestComputeCount;
+    public static int QuestUploadCount;
+
+    static readonly ProfilerMarker GaussianUpdateMarker = new ProfilerMarker("GSAC.GaussianUpdate");
+    static readonly ProfilerMarker GaussianComputeMarker = new ProfilerMarker("GSAC.GaussianCompute");
+    static readonly ProfilerMarker GaussianUploadMarker = new ProfilerMarker("GSAC.GaussianUpload");
     
     // GPU Buffers
     private ComputeBuffer gaussianToFaceBuffer;
@@ -40,6 +62,16 @@ public class TestShaderWithBuffer : MonoBehaviour
     private int cpuOtherStrideWords;
     private GraphicsBuffer questCpuPositionBuffer;
     private int lastQuestCpuUpdateFrame = -1;
+    private NativeArray<int> nativeGaussianToFace;
+    private NativeArray<int3> nativeFaces;
+    private NativeArray<float3> nativeOffsets;
+    private NativeArray<float4> nativeRotations;
+    private NativeArray<Vector3> nativeVertices;
+    private NativeArray<uint> nativePositionData;
+    private NativeArray<Vector3> nativeSortPositions;
+    private NativeArray<uint> nativeOtherData;
+    private bool lastUpdateUsedOptimizedPath;
+    private bool optimizedFailureLogged;
 
     bool UseQuestCpuSplatUpdate
     {
@@ -550,7 +582,6 @@ void DebugFaceBuffer()
         GraphicsBuffer targetPositionBuffer = UseDirectQuestPositionBuffer
             ? gaussianRenderer.m_GpuPosData
             : questCpuPositionBuffer;
-
         GraphicsBuffer targetOtherBuffer = gaussianRenderer.m_GpuOtherData;
 
         if (!isInitialized || cpuPositionData == null || cpuOtherData == null ||
@@ -561,14 +592,143 @@ void DebugFaceBuffer()
         if (vertices == null || vertices.Length == 0)
             return;
 
-        int gaussianCount = cpuPositionData.Length / 3;
+        using (GaussianUpdateMarker.Auto())
+        {
+            bool optimized = false;
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            long computeStart = Stopwatch.GetTimestamp();
+#endif
+            using (GaussianComputeMarker.Auto())
+            {
+                if (useOptimizedQuestCpuUpdate)
+                    optimized = TryComputeOptimized(vertices);
+
+                if (!optimized)
+                {
+                    // Preserve the reference path's skip/retain behavior across diagnostic toggles.
+                    if (lastUpdateUsedOptimizedPath && nativePositionData.IsCreated)
+                    {
+                        nativePositionData.CopyTo(cpuPositionData);
+                        nativeOtherData.CopyTo(cpuOtherData);
+                    }
+                    ComputeQuestCpuReference(vertices, cpuGaussianToFace, cpuFaces, cpuOffsets,
+                        cpuRotations, cpuPositionData, cpuSortPositions, cpuOtherData, cpuOtherStrideWords);
+                }
+                lastUpdateUsedOptimizedPath = optimized;
+            }
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            QuestComputeTicks += Stopwatch.GetTimestamp() - computeStart;
+            ++QuestComputeCount;
+            long uploadStart = Stopwatch.GetTimestamp();
+#endif
+            using (GaussianUploadMarker.Auto())
+            {
+                if (optimized)
+                {
+                    targetPositionBuffer.SetData(nativePositionData);
+                    targetOtherBuffer.SetData(nativeOtherData);
+                }
+                else
+                {
+                    targetPositionBuffer.SetData(cpuPositionData);
+                    targetOtherBuffer.SetData(cpuOtherData);
+                }
+            }
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            QuestUploadTicks += Stopwatch.GetTimestamp() - uploadStart;
+            ++QuestUploadCount;
+#endif
+            lastQuestCpuUpdateFrame = Time.frameCount;
+        }
+    }
+
+    bool TryComputeOptimized(Vector3[] vertices)
+    {
+        try
+        {
+            EnsureNativeCpuData(vertices.Length);
+            nativeVertices.CopyFrom(vertices);
+            if (!lastUpdateUsedOptimizedPath)
+            {
+                nativePositionData.CopyFrom(cpuPositionData);
+                nativeSortPositions.CopyFrom(cpuSortPositions);
+                nativeOtherData.CopyFrom(cpuOtherData);
+            }
+
+            CreateQuestCpuJob(nativeVertices, nativeGaussianToFace, nativeFaces, nativeOffsets,
+                nativeRotations, nativePositionData, nativeSortPositions, nativeOtherData,
+                cpuOtherStrideWords).Schedule(cpuSortPositions.Length, 64).Complete();
+
+            // The renderer's existing CPU sort API owns a managed array; keep that contract.
+            nativeSortPositions.CopyTo(cpuSortPositions);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            if (!optimizedFailureLogged)
+            {
+                Debug.LogWarning("Quest Burst Gaussian update failed; using the existing CPU path. " +
+                    exception.GetType().Name + ": " + exception.Message, this);
+                optimizedFailureLogged = true;
+            }
+            useOptimizedQuestCpuUpdate = false;
+            return false;
+        }
+    }
+
+    void EnsureNativeCpuData(int vertexCount)
+    {
+        if (!nativeGaussianToFace.IsCreated)
+        {
+            try
+            {
+                nativeGaussianToFace = new NativeArray<int>(cpuGaussianToFace, Allocator.Persistent);
+                nativeFaces = new NativeArray<int3>(cpuFaces, Allocator.Persistent);
+                nativeOffsets = new NativeArray<float3>(cpuOffsets, Allocator.Persistent);
+                nativeRotations = new NativeArray<float4>(cpuRotations, Allocator.Persistent);
+                nativePositionData = new NativeArray<uint>(cpuPositionData, Allocator.Persistent);
+                nativeSortPositions = new NativeArray<Vector3>(cpuSortPositions, Allocator.Persistent);
+                nativeOtherData = new NativeArray<uint>(cpuOtherData, Allocator.Persistent);
+            }
+            catch
+            {
+                DisposeNativeCpuData();
+                throw;
+            }
+        }
+        if (!nativeVertices.IsCreated || nativeVertices.Length != vertexCount)
+        {
+            if (nativeVertices.IsCreated)
+                nativeVertices.Dispose();
+            nativeVertices = new NativeArray<Vector3>(vertexCount, Allocator.Persistent,
+                NativeArrayOptions.UninitializedMemory);
+        }
+    }
+
+    void DisposeNativeCpuData()
+    {
+        if (nativeGaussianToFace.IsCreated) nativeGaussianToFace.Dispose();
+        if (nativeFaces.IsCreated) nativeFaces.Dispose();
+        if (nativeOffsets.IsCreated) nativeOffsets.Dispose();
+        if (nativeRotations.IsCreated) nativeRotations.Dispose();
+        if (nativeVertices.IsCreated) nativeVertices.Dispose();
+        if (nativePositionData.IsCreated) nativePositionData.Dispose();
+        if (nativeSortPositions.IsCreated) nativeSortPositions.Dispose();
+        if (nativeOtherData.IsCreated) nativeOtherData.Dispose();
+    }
+
+    static void ComputeQuestCpuReference(Vector3[] vertices, int[] gaussianToFace, int3[] faces,
+        float3[] offsets, float4[] rotations, uint[] positions, Vector3[] sortPositions,
+        uint[] other, int otherStrideWords)
+    {
+        int gaussianCount = positions.Length / 3;
         for (int i = 0; i < gaussianCount; ++i)
         {
-            int faceIndex = cpuGaussianToFace[i];
-            if (faceIndex < 0 || faceIndex >= cpuFaces.Length)
+            int faceIndex = gaussianToFace[i];
+            if (faceIndex < 0 || faceIndex >= faces.Length)
                 continue;
 
-            int3 face = cpuFaces[faceIndex];
+            int3 face = faces[faceIndex];
             if (face.x < 0 || face.x >= vertices.Length ||
                 face.y < 0 || face.y >= vertices.Length ||
                 face.z < 0 || face.z >= vertices.Length)
@@ -595,32 +755,148 @@ void DebugFaceBuffer()
             float k = (h + vec3Length) * 0.5f / 0.05f;
 
             float4 faceRotation = MatrixToQuaternionWxyz(rot);
-            float4 gaussianRotation = NormalizeQuaternionWxyz(cpuRotations[i]);
+            float4 gaussianRotation = NormalizeQuaternionWxyz(rotations[i]);
             float4 gaussianWorldRotation = MultiplyQuaternionsWxyz(faceRotation, gaussianRotation);
             gaussianWorldRotation.x *= -1.0f;
             gaussianWorldRotation.y *= -1.0f;
 
-            float3 pos = t + QuaternionApplyWxyz(faceRotation, cpuOffsets[i]) * k;
+            float3 pos = t + QuaternionApplyWxyz(faceRotation, offsets[i]) * k;
             pos.x *= -1.0f;
-            cpuSortPositions[i] = new Vector3(pos.x, pos.y, pos.z);
+            sortPositions[i] = new Vector3(pos.x, pos.y, pos.z);
 
             int outIndex = i * 3;
-            cpuPositionData[outIndex] = math.asuint(pos.x);
-            cpuPositionData[outIndex + 1] = math.asuint(pos.y);
-            cpuPositionData[outIndex + 2] = math.asuint(pos.z);
+            positions[outIndex] = math.asuint(pos.x);
+            positions[outIndex + 1] = math.asuint(pos.y);
+            positions[outIndex + 2] = math.asuint(pos.z);
 
             float4 normalizedRotXyzw = NormalizeQuaternionXyzw(new float4(
                 gaussianWorldRotation.y,
                 gaussianWorldRotation.z,
                 gaussianWorldRotation.w,
                 gaussianWorldRotation.x));
-            cpuOtherData[i * cpuOtherStrideWords] = EncodeQuatToNorm10(PackSmallest3Rotation(normalizedRotXyzw));
+            other[i * otherStrideWords] = EncodeQuatToNorm10(PackSmallest3Rotation(normalizedRotXyzw));
         }
-
-        targetPositionBuffer.SetData(cpuPositionData);
-        targetOtherBuffer.SetData(cpuOtherData);
-        lastQuestCpuUpdateFrame = Time.frameCount;
     }
+
+    static QuestCpuUpdateJob CreateQuestCpuJob(NativeArray<Vector3> vertices,
+        NativeArray<int> gaussianToFace, NativeArray<int3> faces, NativeArray<float3> offsets,
+        NativeArray<float4> rotations, NativeArray<uint> positions, NativeArray<Vector3> sortPositions,
+        NativeArray<uint> other, int otherStrideWords)
+    {
+        return new QuestCpuUpdateJob
+        {
+            vertices = vertices,
+            gaussianToFace = gaussianToFace,
+            faces = faces,
+            offsets = offsets,
+            rotations = rotations,
+            positions = positions,
+            sortPositions = sortPositions,
+            other = other,
+            otherStrideWords = otherStrideWords
+        };
+    }
+
+    [BurstCompile(FloatMode = FloatMode.Strict, CompileSynchronously = true)]
+    struct QuestCpuUpdateJob : IJobParallelFor
+    {
+        [ReadOnly] public NativeArray<Vector3> vertices;
+        [ReadOnly] public NativeArray<int> gaussianToFace;
+        [ReadOnly] public NativeArray<int3> faces;
+        [ReadOnly] public NativeArray<float3> offsets;
+        [ReadOnly] public NativeArray<float4> rotations;
+        // Each iteration exclusively writes its own three position words and first other word.
+        [NativeDisableParallelForRestriction] public NativeArray<uint> positions;
+        public NativeArray<Vector3> sortPositions;
+        [NativeDisableParallelForRestriction] public NativeArray<uint> other;
+        public int otherStrideWords;
+
+        public void Execute(int i)
+        {
+            int faceIndex = gaussianToFace[i];
+            if (faceIndex < 0 || faceIndex >= faces.Length)
+                return;
+
+            int3 face = faces[faceIndex];
+            if (face.x < 0 || face.x >= vertices.Length ||
+                face.y < 0 || face.y >= vertices.Length ||
+                face.z < 0 || face.z >= vertices.Length)
+                return;
+
+            float3 v0 = ToFloat3(vertices[face.x]);
+            float3 v1 = ToFloat3(vertices[face.y]);
+            float3 v2 = ToFloat3(vertices[face.z]);
+
+            float3 t = (v0 + v1 + v2) / 3.0f;
+            float3 vec1 = v2 - v1;
+            float3 vec2 = v0 - v1;
+            float3 vec3 = v0 - v2;
+            float3 faceNormal = math.cross(vec1, vec2);
+            float3 norm = NormalizeSafe(faceNormal);
+
+            vec1 = NormalizeSafe(vec1);
+            float3 prod = NormalizeSafe(math.cross(vec1, norm));
+            float3x3 rot = new float3x3(vec1, norm, prod);
+
+            float area = math.length(faceNormal);
+            float vec3Length = math.max(math.length(vec3), 1e-6f);
+            float h = area / vec3Length;
+            float k = (h + vec3Length) * 0.5f / 0.05f;
+
+            float4 faceRotation = MatrixToQuaternionWxyz(rot);
+            float4 gaussianRotation = NormalizeQuaternionWxyz(rotations[i]);
+            float4 gaussianWorldRotation = MultiplyQuaternionsWxyz(faceRotation, gaussianRotation);
+            gaussianWorldRotation.x *= -1.0f;
+            gaussianWorldRotation.y *= -1.0f;
+
+            float3 pos = t + QuaternionApplyWxyz(faceRotation, offsets[i]) * k;
+            pos.x *= -1.0f;
+            sortPositions[i] = new Vector3(pos.x, pos.y, pos.z);
+
+            int outIndex = i * 3;
+            positions[outIndex] = math.asuint(pos.x);
+            positions[outIndex + 1] = math.asuint(pos.y);
+            positions[outIndex + 2] = math.asuint(pos.z);
+
+            float4 normalizedRotXyzw = NormalizeQuaternionXyzw(new float4(
+                gaussianWorldRotation.y,
+                gaussianWorldRotation.z,
+                gaussianWorldRotation.w,
+                gaussianWorldRotation.x));
+            other[i * otherStrideWords] = EncodeQuatToNorm10(PackSmallest3Rotation(normalizedRotXyzw));
+        }
+    }
+
+#if UNITY_EDITOR
+    public static void ComputeQuestCpuReferenceForValidation(Vector3[] vertices, int[] gaussianToFace,
+        int3[] faces, float3[] offsets, float4[] rotations, uint[] positions,
+        Vector3[] sortPositions, uint[] other, int otherStrideWords)
+    {
+        ComputeQuestCpuReference(vertices, gaussianToFace, faces, offsets, rotations,
+            positions, sortPositions, other, otherStrideWords);
+    }
+
+    public static void ComputeQuestCpuBurstForValidation(Vector3[] vertices, int[] gaussianToFace,
+        int3[] faces, float3[] offsets, float4[] rotations, uint[] positions,
+        Vector3[] sortPositions, uint[] other, int otherStrideWords)
+    {
+        using (var v = new NativeArray<Vector3>(vertices, Allocator.TempJob))
+        using (var g = new NativeArray<int>(gaussianToFace, Allocator.TempJob))
+        using (var f = new NativeArray<int3>(faces, Allocator.TempJob))
+        using (var o = new NativeArray<float3>(offsets, Allocator.TempJob))
+        using (var r = new NativeArray<float4>(rotations, Allocator.TempJob))
+        using (var p = new NativeArray<uint>(positions, Allocator.TempJob))
+        using (var s = new NativeArray<Vector3>(sortPositions, Allocator.TempJob))
+        using (var d = new NativeArray<uint>(other, Allocator.TempJob))
+        {
+            CreateQuestCpuJob(v, g, f, o, r, p, s, d, otherStrideWords)
+                .Schedule(sortPositions.Length, 64).Complete();
+            p.CopyTo(positions);
+            s.CopyTo(sortPositions);
+            d.CopyTo(other);
+        }
+    }
+#endif
 
     static float3 ToFloat3(Vector3 v)
     {
@@ -806,6 +1082,7 @@ void DebugFaceBuffer()
 
     void OnDestroy()
     {
+        DisposeNativeCpuData();
         if (UseQuestCpuSplatUpdate && gaussianRenderer != null)
         {
             gaussianRenderer.SetUpdatedPositionsBuffer(null);
