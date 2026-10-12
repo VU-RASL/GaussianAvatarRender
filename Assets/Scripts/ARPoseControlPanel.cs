@@ -12,6 +12,7 @@ public sealed class ARPoseControlPanel : MonoBehaviour
         Clean,
         TAPose,
         Pose1,
+        ToggleMeshes,
     }
 
     [SerializeField] PoseController poseController;
@@ -33,6 +34,7 @@ public sealed class ARPoseControlPanel : MonoBehaviour
     Material pointerMaterial;
     Button hoveredButton;
     Button pressedButton;
+    QuestSavedRoomMesh savedRoomMesh;
 
     static readonly Color PanelColor = new(0.05f, 0.06f, 0.07f, 0.55f);
     static readonly Color ButtonColor = new(0.16f, 0.23f, 0.29f, 0.88f);
@@ -124,15 +126,16 @@ public sealed class ARPoseControlPanel : MonoBehaviour
         scaler.dynamicPixelsPerUnit = 900.0f;
 
         RectTransform panelRect = panelRoot.GetComponent<RectTransform>();
-        panelRect.sizeDelta = new Vector2(520.0f, 190.0f);
+        panelRect.sizeDelta = new Vector2(690.0f, 190.0f);
 
         Image panelImage = panelRoot.AddComponent<Image>();
         panelImage.color = PanelColor;
 
-        CreateBitmapLabel(panelRect, "POSE CONTROL", new Vector2(0.0f, 58.0f), new Vector2(380.0f, 34.0f), 4);
-        CreateButton(panelRect, "CLEAN", new Vector2(-170.0f, -30.0f), PoseAction.Clean);
-        CreateButton(panelRect, "T-A", new Vector2(0.0f, -30.0f), PoseAction.TAPose);
-        CreateButton(panelRect, "POSE 1", new Vector2(170.0f, -30.0f), PoseAction.Pose1);
+        CreateBitmapLabel(panelRect, "SCENE CONTROL", new Vector2(0.0f, 58.0f), new Vector2(380.0f, 34.0f), 4);
+        CreateButton(panelRect, "CLEAN", new Vector2(-255.0f, -30.0f), PoseAction.Clean);
+        CreateButton(panelRect, "T-A", new Vector2(-85.0f, -30.0f), PoseAction.TAPose);
+        CreateButton(panelRect, "POSE 1", new Vector2(85.0f, -30.0f), PoseAction.Pose1);
+        CreateButton(panelRect, "MESH", new Vector2(255.0f, -30.0f), PoseAction.ToggleMeshes);
     }
 
     void CreateButton(RectTransform parent, string label, Vector2 anchoredPosition, PoseAction action)
@@ -153,7 +156,7 @@ public sealed class ARPoseControlPanel : MonoBehaviour
         buttonImages[button] = image;
 
         BoxCollider collider = buttonObject.GetComponent<BoxCollider>();
-        collider.size = new Vector3(220.0f, 130.0f, 80.0f);
+        collider.size = new Vector3(rect.sizeDelta.x, rect.sizeDelta.y, 20.0f);
         collider.center = Vector3.zero;
 
         CreateBitmapLabel(rect, label, Vector2.zero, new Vector2(132.0f, 30.0f), 5);
@@ -325,6 +328,12 @@ public sealed class ARPoseControlPanel : MonoBehaviour
 
     void ApplyPoseAction(PoseAction action)
     {
+        if (action == PoseAction.ToggleMeshes)
+        {
+            if (savedRoomMesh == null) savedRoomMesh = FindObjectOfType<QuestSavedRoomMesh>(true);
+            if (savedRoomMesh != null) savedRoomMesh.ToggleMeshes();
+            return;
+        }
         EnsureReferences();
         if (poseController == null)
             return;
@@ -520,6 +529,10 @@ public sealed class ARPoseControlPanel : MonoBehaviour
                 return new[] { "01111", "10000", "10000", "10000", "10000", "10000", "01111" };
             case 'E':
                 return new[] { "11111", "10000", "10000", "11110", "10000", "10000", "11111" };
+            case 'H':
+                return new[] { "10001", "10001", "10001", "11111", "10001", "10001", "10001" };
+            case 'M':
+                return new[] { "10001", "11011", "10101", "10101", "10001", "10001", "10001" };
             case 'L':
                 return new[] { "10000", "10000", "10000", "10000", "10000", "10000", "11111" };
             case 'N':
