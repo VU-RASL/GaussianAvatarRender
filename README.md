@@ -41,6 +41,43 @@ showHeadsetFps: disabled
 runPerformanceProtocol: disabled
 ```
 
+## Aim 2 chair memory recording example
+
+Use the existing Quest avatar app and the saved room containing the user-confirmed `Chair_01`. The left Touch controller buttons are **X** and **Y** (the first and second buttons referred to as A/B in the recording plan).
+
+Before recording, press **right B** to show the complete saved room scan in blue. While it is visible, press **right A** to reveal the orange chair mesh, forward arrow, bounding box, and **T0** label. This presentation step represents an assumed segmentation/orientation result; it does not run a segmentation algorithm.
+
+1. With the physical chair at its scanned position **T0**, press **left X**. The avatar moves to the chair's original location and heading.
+2. Move the physical chair away. Press **left X** again: the avatar still goes to **T0**, demonstrating the stale chair information.
+3. Press **left Y once** to reveal the virtual **T1** chair mesh, bounding box, arrow, and label. The avatar stays where it is, including any manual joystick offset; chair memory still remains at T0. Align the physical chair with the revealed target.
+4. Press **left Y again** to update chair memory and place the avatar at T1. Every subsequent Y press places it at the same T1 location and heading.
+
+T1 is a fixed example input: **0.9 m along the chair's original forward direction, with a 90 degree left turn (-90 degrees yaw)**. It represents the assumed output of a future pose-estimation algorithm. Repeated X presses always select T0. After the initial reveal, repeated Y presses always select T1, without accumulating motion. X after Y restores T0 for another take. Physical chair movement is not detected automatically.
+
+**Left index trigger** toggles between a built-in static **Sitting** pose and the existing **No Pose** state. Release the trigger between presses. Sitting uses the existing custom SMPL-X joint interface with a reversible pelvis offset to preserve floor contact; it does not play an imported animation. The user-supplied custom pose array is preserved.
+
+X/Y placement keeps the current body pose. Placement accounts for the Gaussian body's offset from the avatar root and places its feet at the chair's floor footprint. Room geometry and the initial T0 reference remain unchanged. The selected avatar position follows room-anchor relocalization.
+
+**Left thumbstick** moves the avatar horizontally relative to your viewing direction, at up to 0.5 m/s. It keeps the avatar's height and facing direction unchanged. This manual movement does not move either chair target or update chair memory. Press X to return exactly to T0; after T1 has been revealed, press Y to return exactly to T1.
+
+On every fresh app launch, all room/chair meshes start hidden and the segmentation reveal resets. Until **right A** succeeds, **right B** only shows/hides the complete blue room scan, including the original chair triangles. A while meshes are hidden or the room is unavailable does nothing. After A, the T1 mesh, bounds, arrow, and label remain hidden until the first successful **left Y** press. The first Y press reveals only the target and does not move the avatar or update chair memory. T1 remains revealed for retakes, including after X returns the chair memory to T0; X does not reset the two-stage Y sequence. Restart the app to begin again with T1 hidden.
+
+The left trigger is reserved for sitting in this demo. The test ball remains grabbable with either grip or the right trigger.
+
+**Right A** reveals segmentation once per app session; later A presses do not hide it or move the avatar. After that reveal, **right B** shows/hides the room, orange chair, and eligible markers together, retaining the accepted 0.19 behavior. B, X, and room relocalization preserve the revealed phase. It never reveals T1 before the first Y press. Release buttons between presses; B takes priority if A and B are pressed together. The orange **T0** label stays above the original chair bounding box; the cyan **T1** label marks the updated target once revealed.
+
+Build with **Gaussian Splatting > Aim 2 > Build Avatar with Hardcoded Chair Example**. The build validates the chair reference, staged mesh presentation, T0/T1 behavior, avatar placement, sitting pose, and controller input before writing `Builds/avatar-chair-example.apk` (version 0.20). Installation alone does not launch the app. Runtime diagnostics are written to `chair-avatar-example-status.json` in the app's persistent data directory.
+
+### Developer Hub launch permission
+
+On the tested Quest 3 (Android API 34), Developer Hub disabled **Launch app** because the installed package listed `android.permission.POST_NOTIFICATIONS` as ungranted, although the APK did not declare it and the app launched normally from the headset. Granting this permission to the development installation resolved the warning:
+
+```sh
+adb shell pm grant com.DefaultCompany.UnityGaussianSplatting android.permission.POST_NOTIFICATIONS
+```
+
+Refresh the Developer Hub Apps list after granting it. This is a device permission setting; it does not change the demo or its APK.
+
 ## Requirements
 
 - Unity `2022.3.7f1`

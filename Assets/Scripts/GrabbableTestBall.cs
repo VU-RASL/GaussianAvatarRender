@@ -15,6 +15,7 @@ public sealed class GrabbableTestBall : MonoBehaviour
     [SerializeField] float aimRayWidth = 0.008f;
     [SerializeField] float hitDotSize = 0.035f;
     [SerializeField] bool useTrigger = true;
+    [SerializeField] bool reserveLeftTriggerForAvatarPose;
     [SerializeField] bool useGrip = true;
     [SerializeField] bool usePrimaryButton;
     [SerializeField] bool allowMouseInEditor = true;
@@ -303,7 +304,7 @@ public sealed class GrabbableTestBall : MonoBehaviour
         if (!device.isValid)
             return false;
 
-        if (useTrigger)
+        if (useTrigger && !(reserveLeftTriggerForAvatarPose && node == XRNode.LeftHand))
         {
             if (device.TryGetFeatureValue(CommonUsages.triggerButton, out bool triggerPressed) && triggerPressed)
                 return true;

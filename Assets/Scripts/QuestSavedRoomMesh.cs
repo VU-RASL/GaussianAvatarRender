@@ -37,7 +37,7 @@ public sealed partial class QuestSavedRoomMesh : MonoBehaviour
     bool paused, finished;
     double lastStatusWrite;
 
-    void OnApplicationPause(bool value) { paused = value; }
+    void OnApplicationPause(bool value) { paused = value; if (value) meshPresentationInput.Reset(); }
 
     IEnumerator Start()
     {
@@ -346,6 +346,7 @@ public sealed partial class QuestSavedRoomMesh : MonoBehaviour
     void LateUpdate()
     {
         PollMeshVisibilityInput();
+        UpdateChairExampleMarker();
         if (headCamera == null || !finished) return;
         for (int i = 0; i < previewLocations.Count; i++)
         {
@@ -414,6 +415,7 @@ public sealed partial class QuestSavedRoomMesh : MonoBehaviour
     }
     void OnDestroy()
     {
+        DisposeChairExampleMarker();
         DisposeChairReference();
         DisposeObjectAnchors();
         foreach (var mesh in previewMeshes) Destroy(mesh);

@@ -22,6 +22,16 @@ public static class AvatarRoomMeshEditor
             throw new BuildFailedException("Use the existing avatar Oculus AR profile before reading the saved mesh.");
         var reader = UnityEngine.Object.FindObjectOfType<QuestSavedRoomMesh>(true);
         if (reader == null) reader = new GameObject("Aim 2 Saved Room Mesh").AddComponent<QuestSavedRoomMesh>();
+        var example = reader.GetComponent<QuestChairAvatarExample>();
+        if (example == null) example = reader.gameObject.AddComponent<QuestChairAvatarExample>();
+        example.enabled = true;
+        // Left index trigger belongs to the chair demo's sit/no-pose toggle.
+        foreach (var ball in UnityEngine.Object.FindObjectsOfType<GrabbableTestBall>(true))
+        {
+            var ballSettings = new SerializedObject(ball);
+            ballSettings.FindProperty("reserveLeftTriggerForAvatarPose").boolValue = true;
+            ballSettings.ApplyModifiedPropertiesWithoutUndo();
+        }
         const string materialPath = "Assets/Shaders/AvatarRoomMesh.mat";
         var material = AssetDatabase.LoadAssetAtPath<Material>(materialPath);
         if (material == null)
@@ -33,6 +43,7 @@ public static class AvatarRoomMeshEditor
         }
         var serialized = new SerializedObject(reader);
         serialized.FindProperty("meshMaterial").objectReferenceValue = material;
+        serialized.FindProperty("showMeshes").boolValue = false;
         serialized.ApplyModifiedPropertiesWithoutUndo();
         EditorSceneManager.MarkSceneDirty(scene);
         EditorSceneManager.SaveScene(scene);
@@ -44,24 +55,27 @@ public static class AvatarRoomMeshEditor
         Debug.Log("AVATAR_ROOM_MESH_CONFIGURED existing scene=" + ScenePath);
     }
 
-    [MenuItem("Gaussian Splatting/Aim 2/Build Avatar with Mesh Visibility Toggle")]
+    [MenuItem("Gaussian Splatting/Aim 2/Build Avatar with Hardcoded Chair Example")]
     public static void Build()
     {
         Aim2ChairBaselineEditor.Validate();
         Configure();
+        if (!PoseController.RunSittingPoseSmokeTest(out string sittingReport))
+            throw new BuildFailedException("Sitting pose validation failed: " + sittingReport);
+        Debug.Log("AIM2_SITTING_POSE_VALIDATED " + sittingReport);
         string previousVersion = PlayerSettings.bundleVersion;
         int previousCode = PlayerSettings.Android.bundleVersionCode;
         AndroidSdkVersions previousTarget = PlayerSettings.Android.targetSdkVersion;
         try
         {
             // Keep the original avatar package and signing; install over the mesh reader build.
-            PlayerSettings.Android.bundleVersionCode = Math.Max(previousCode, 14);
-            PlayerSettings.bundleVersion = "0.14";
+            PlayerSettings.Android.bundleVersionCode = Math.Max(previousCode, 20);
+            PlayerSettings.bundleVersion = "0.20";
             PlayerSettings.Android.targetSdkVersion = (AndroidSdkVersions)32;
             Directory.CreateDirectory("Builds");
             var report = BuildPipeline.BuildPlayer(new BuildPlayerOptions {
                 scenes = new[] { ScenePath },
-                locationPathName = "Builds/avatar-mesh-toggle.apk",
+                locationPathName = "Builds/avatar-chair-example.apk",
                 target = BuildTarget.Android,
                 options = BuildOptions.Development
             });

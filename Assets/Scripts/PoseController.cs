@@ -80,7 +80,334 @@ public class PoseController : MonoBehaviour
     public bool APose => a_pose;
     public event Action<PoseController> BeforeVertexBake;
     bool vertexBakeRequested;
+    static readonly int[] SittingRequiredJoints = { 0, 1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 16, 17, 18, 19 };
+    bool isSittingPose;
+    bool sittingPoseBakePending;
+    Transform sittingPelvis;
+    Vector3 sittingPelvisBaseLocalPosition;
+    Vector3 sittingPelvisOffsetInMesh;
+    float sittingPelvisLowering;
+    float[] sittingPoseValues;
+    string sittingPoseDetail = "Sitting pose has not been requested.";
 
+    public bool IsSittingPose => isSittingPose;
+    public bool CanToggleSittingPose => SittingRuntimeReady(out _);
+    public string SittingPoseDetail => SittingRuntimeReady(out string waiting) ? sittingPoseDetail : waiting;
+
+    bool SittingRuntimeReady(out string detail)
+    {
+        if (!isActiveAndEnabled || smplx == null || smr == null || bakedMesh == null ||
+            !hasInitialTransforms || joints == null || joints.Length != customJointNames.Length ||
+            vertexBuffer == null || !vertexBuffer.IsValid() || currentVertices == null || currentVertices.Length == 0)
+        { detail = "Waiting for the avatar joints and first vertex bake."; return false; }
+        foreach (int index in SittingRequiredJoints)
+            if (joints[index] == null)
+            { detail = "The sitting pose requires the complete pelvis, leg, and arm skeleton."; return false; }
+        if (sittingPoseBakePending)
+        { detail = "Waiting for the sitting/No Pose change to reach the next vertex bake."; return false; }
+        detail = "";
+        return true;
+    }
+
+    public bool TryApplySittingPose()
+    {
+        if (!SittingRuntimeReady(out string detail)) { sittingPoseDetail = detail; return false; }
+        if (isSittingPose) return true;
+        return ApplySittingPoseCore();
+    }
+
+    public bool TryRestoreNoPose()
+    {
+        if (!SittingRuntimeReady(out string detail)) { sittingPoseDetail = detail; return false; }
+        ApplyCleanPose(); // The existing exact No Pose path, not the previous animation or A pose.
+        sittingPoseDetail = "Restored the existing No Pose state.";
+        sittingPoseBakePending = true;
+        RequestImmediateVertexBake();
+        return true;
+    }
+
+    bool ApplySittingPoseCore()
+    {
+        try
+        {
+            // Start from the same neutral body and joint positions as No Pose.
+            // Neither this path nor the built-in pose overwrites serialized customPose.
+            ApplyCleanPose();
+            if (!TryMeasureVisibleFloor(out float standingFloor))
+                throw new InvalidOperationException("The standing body has no finite baked geometry.");
+            float[] pose = GenerateSittingPose();
+            ApplyStableCustomPose(pose, false);
+            if (!TryMeasureVisibleFloor(out float bentFloor))
+                throw new InvalidOperationException("The seated body has no finite baked geometry.");
+            float lowering = standingFloor - bentFloor;
+            if (float.IsNaN(lowering) || float.IsInfinity(lowering) || lowering > 0.02f || lowering < -1.5f)
+                throw new InvalidOperationException("The seated floor compensation is outside the supported range.");
+            sittingPelvis = joints[0];
+            sittingPelvisBaseLocalPosition = sittingPelvis.localPosition;
+            // BakeMesh is mesh-local and Gaussian rendering reverses the baked X
+            // reflection. A mesh-local bone translation therefore moves the visible
+            // body; moving SMPLX's parent would cancel during the bake.
+            sittingPelvisOffsetInMesh = transform.InverseTransformVector(Vector3.up * lowering);
+            sittingPelvisLowering = lowering;
+            sittingPoseValues = pose;
+            isSittingPose = true;
+            ApplySittingPelvisOffset();
+            sittingPoseDetail = "Hardcoded sitting pose applied; pelvis lowered " + (-lowering).ToString("F3") +
+                " m to preserve the original foot contact. Avatar root and custom pose data are unchanged.";
+            sittingPoseBakePending = true;
+            RequestImmediateVertexBake();
+            return true;
+        }
+        catch (Exception error)
+        {
+            ApplyCleanPose();
+            RequestImmediateVertexBake();
+            sittingPoseDetail = "Sitting pose rejected; restored No Pose: " + error.Message;
+            return false;
+        }
+    }
+
+    float[] GenerateSittingPose()
+    {
+        float[] pose = new float[customJointNames.Length * 3];
+        // This interface is Unity local Euler DEGREES, not SMPL axis-angle radians.
+        // The actual male-model bind/template has downward thigh/shin vectors and
+        // +Z toe vectors. -90 X sends thighs forward; +90 at knees returns shins down.
+        SetCustomJointEuler(pose, "left_hip", new Vector3(-90f, 0, 0));
+        SetCustomJointEuler(pose, "right_hip", new Vector3(-90f, 0, 0));
+        SetCustomJointEuler(pose, "left_knee", new Vector3(90f, 0, 0));
+        SetCustomJointEuler(pose, "right_knee", new Vector3(90f, 0, 0));
+        // Left arm extends toward -X in Unity after the SMPL X conversion.
+        // Mirrored Z/Y angles lower both arms and let the forearms rest forward.
+        SetCustomJointEuler(pose, "left_collar", new Vector3(0, 0, 5f));
+        SetCustomJointEuler(pose, "right_collar", new Vector3(0, 0, -5f));
+        SetCustomJointEuler(pose, "left_shoulder", new Vector3(0, 0, 75f));
+        SetCustomJointEuler(pose, "right_shoulder", new Vector3(0, 0, -75f));
+        SetCustomJointEuler(pose, "left_elbow", new Vector3(0, 60f, 0));
+        SetCustomJointEuler(pose, "right_elbow", new Vector3(0, -60f, 0));
+        return pose;
+    }
+
+    bool TryMeasureVisibleFloor(out float floor)
+    {
+        floor = float.PositiveInfinity;
+        if (smr == null || bakedMesh == null) return false;
+        smr.BakeMesh(bakedMesh);
+        bakedMesh.GetVertices(bakedVertexList);
+        foreach (Vector3 vertex in bakedVertexList)
+        {
+            // This is the unreflected BakeMesh output, before UpdateVertexBuffer.
+            Vector3 visible = transform.TransformPoint(vertex);
+            if (float.IsNaN(visible.y) || float.IsInfinity(visible.y)) return false;
+            floor = Mathf.Min(floor, visible.y);
+        }
+        return !float.IsInfinity(floor);
+    }
+
+    void ApplySittingPelvisOffset()
+    {
+        if (!isSittingPose || sittingPelvis == null || sittingPelvis.parent == null || smr == null) return;
+        Vector3 sourceWorldOffset = smr.transform.TransformVector(sittingPelvisOffsetInMesh);
+        Vector3 parentLocalOffset = sittingPelvis.parent.InverseTransformVector(sourceWorldOffset);
+        sittingPelvis.localPosition = sittingPelvisBaseLocalPosition + parentLocalOffset;
+    }
+
+    void ClearSittingPoseState()
+    {
+        if (isSittingPose && sittingPelvis != null)
+            sittingPelvis.localPosition = sittingPelvisBaseLocalPosition;
+        if (isSittingPose) RequestImmediateVertexBake();
+        isSittingPose = false;
+        sittingPoseBakePending = false;
+        sittingPelvis = null;
+        sittingPelvisOffsetInMesh = Vector3.zero;
+        sittingPoseValues = null;
+    }
+
+#if UNITY_EDITOR
+    [Serializable] sealed class SittingJointSample
+    {
+        public string name;
+        public Vector3 standing, sitting;
+    }
+    [Serializable] sealed class SittingValidationRecord
+    {
+        public bool passed;
+        public string report, sourceModel;
+        public float standingFloorY, sittingFloorY, pelvisLowering, sittingHipHeight, restoredVertexError, repeatedVertexError;
+        public Vector3[] standingVertices, sittingVertices;
+        public SittingJointSample[] joints;
+    }
+
+    // Uses a hidden clone of the scene's actual shaped SMPL-X mesh, without GPU
+    // buffers or editing the source scene. The normal runtime core is shared.
+    public static bool RunSittingPoseSmokeTest(out string report)
+    {
+        report = "Sitting pose validation did not complete.";
+        var record = new SittingValidationRecord();
+        GameObject root = null;
+        PoseController fixture = null;
+        SkinnedMeshRenderer renderer = null;
+        Mesh copiedMesh = null, sourceMesh = null;
+        try
+        {
+            PoseController source = null;
+            GameObject avatar = GameObject.Find("Avatar");
+            if (avatar != null) source = avatar.GetComponentInChildren<PoseController>(true);
+            if (source == null || source.smplx == null)
+                throw new InvalidOperationException("Open the actual avatar scene before sitting-pose validation.");
+            if (source.hahaImporter == null || !source.hahaImporter.EnsureLoaded() || source.hahaImporter.data == null)
+                throw new InvalidOperationException("The scene avatar shape data is unavailable.");
+            record.sourceModel = source.smplx.name;
+            root = new GameObject("SittingPoseValidation") { hideFlags = HideFlags.HideAndDontSave };
+            GameObject model = Instantiate(source.smplx.gameObject, root.transform, false);
+            renderer = model.GetComponentInChildren<SkinnedMeshRenderer>(true);
+            if (renderer == null || renderer.sharedMesh == null)
+                throw new InvalidOperationException("The real SMPL-X clone has no skinned mesh.");
+            sourceMesh = renderer.sharedMesh;
+            copiedMesh = Instantiate(sourceMesh);
+            renderer.sharedMesh = copiedMesh;
+            // SMPLX caches its renderer using an active-child lookup in Awake.
+            // Initialize only this isolated model before disabling the fixture host.
+            model.GetComponent<SMPLX>().Awake();
+            root.SetActive(false);
+            var gaussian = new GameObject("VisibleGaussianCoordinates");
+            gaussian.transform.SetParent(root.transform, false);
+            gaussian.transform.localPosition = source.transform.localPosition;
+            gaussian.transform.localRotation = source.transform.localRotation;
+            gaussian.transform.localScale = source.transform.localScale;
+            fixture = gaussian.AddComponent<PoseController>();
+            fixture.smplx = model.GetComponent<SMPLX>();
+            fixture.smr = renderer;
+            fixture.bakedMesh = new Mesh { name = "SittingValidationBake" };
+            fixture.smplx.Awake();
+            fixture.smplx.betas = (float[])source.hahaImporter.data.betas.Clone();
+            fixture.smplx.ResetBodyPose();
+            fixture.smplx.SetBetaShapes();
+            fixture.CacheInitialTransforms();
+            fixture.CacheAnimators();
+            fixture.InitializeJoints();
+            fixture.customPose = new float[fixture.customJointNames.Length * 3];
+            fixture.customPose[3] = 12.25f;
+            fixture.customPose[18] = -7.5f;
+            float[] savedCustom = fixture.customPose;
+            float[] savedCustomValues = (float[])savedCustom.Clone();
+            fixture.ApplyCleanPose();
+            Vector3[] standing = fixture.ValidationVisibleVertices();
+            record.standingFloorY = ValidationFloor(standing);
+            record.standingVertices = ValidationSample(standing);
+            int[] jointIndices = { 0, 1, 2, 4, 5, 7, 8, 10, 11, 12, 15, 16, 17, 18, 19, 20, 21 };
+            record.joints = new SittingJointSample[jointIndices.Length];
+            for (int i = 0; i < jointIndices.Length; ++i)
+                record.joints[i] = new SittingJointSample {
+                    name = fixture.customJointNames[jointIndices[i]], standing = fixture.ValidationJoint(jointIndices[i]) };
+            Pose rootBefore = new Pose(root.transform.position, root.transform.rotation);
+            Vector3 rootScale = root.transform.localScale, gaussianBefore = gaussian.transform.localPosition;
+            if (!fixture.ApplySittingPoseCore()) throw new InvalidOperationException(fixture.sittingPoseDetail);
+            Vector3[] sitting = fixture.ValidationVisibleVertices();
+            record.sittingVertices = ValidationSample(sitting);
+            record.sittingFloorY = ValidationFloor(sitting);
+            record.pelvisLowering = -fixture.sittingPelvisLowering;
+            record.sittingHipHeight = (fixture.ValidationJoint(1).y + fixture.ValidationJoint(2).y) * 0.5f - record.sittingFloorY;
+            for (int i = 0; i < jointIndices.Length; ++i) record.joints[i].sitting = fixture.ValidationJoint(jointIndices[i]);
+            if (Mathf.Abs(record.sittingFloorY - record.standingFloorY) > 0.0002f ||
+                record.pelvisLowering < 0.15f || record.pelvisLowering > 0.8f ||
+                record.sittingHipHeight < 0.25f || record.sittingHipHeight > 0.8f)
+                throw new InvalidOperationException("Seated floor or hip height is implausible: floor error=" +
+                    (record.sittingFloorY - record.standingFloorY) + ", lowering=" + record.pelvisLowering + ", hip height=" + record.sittingHipHeight);
+            foreach (int side in new[] { 0, 1 })
+            {
+                Vector3 hip = fixture.ValidationJoint(1 + side), knee = fixture.ValidationJoint(4 + side);
+                Vector3 ankle = fixture.ValidationJoint(7 + side);
+                Vector3 forward = gaussian.transform.forward;
+                if (Vector3.Dot((knee - hip).normalized, forward) < 0.9f ||
+                    Vector3.Dot((ankle - knee).normalized, Vector3.down) < 0.9f ||
+                    Vector3.Angle(hip - knee, ankle - knee) < 70f || Vector3.Angle(hip - knee, ankle - knee) > 110f)
+                    throw new InvalidOperationException("Actual-model thigh/shin direction or knee bend is invalid on side " + side);
+                Vector3 shoulder = fixture.ValidationJoint(16 + side), elbow = fixture.ValidationJoint(18 + side);
+                Vector3 wrist = fixture.ValidationJoint(20 + side);
+                if (shoulder.y - wrist.y < 0.2f || Vector3.Dot(wrist - elbow, forward) <= 0f)
+                    throw new InvalidOperationException("Actual-model arm direction is invalid on side " + side);
+            }
+            for (int i = 0; i < 3; ++i)
+            {
+                fixture.ApplyCustomPose(fixture.activeCustomPose);
+                record.repeatedVertexError = Mathf.Max(record.repeatedVertexError,
+                    ValidationMaxError(sitting, fixture.ValidationVisibleVertices()));
+            }
+            if (record.repeatedVertexError > 0.00005f)
+                throw new InvalidOperationException("Repeated sitting pose accumulated a pelvis offset.");
+            fixture.ApplyCleanPose();
+            record.restoredVertexError = ValidationMaxError(standing, fixture.ValidationVisibleVertices());
+            if (!fixture.NoPose || fixture.IsSittingPose || fixture.a_pose || fixture.using_custom ||
+                record.restoredVertexError > 0.00005f)
+                throw new InvalidOperationException("No Pose did not restore the exact original baked body: " + record.restoredVertexError);
+            if (!ReferenceEquals(savedCustom, fixture.customPose)) throw new InvalidOperationException("Sitting replaced the user's custom pose array.");
+            for (int i = 0; i < savedCustom.Length; ++i)
+                if (savedCustom[i] != savedCustomValues[i]) throw new InvalidOperationException("Sitting modified the user's custom pose values.");
+            if (root.transform.position != rootBefore.position || root.transform.rotation != rootBefore.rotation ||
+                root.transform.localScale != rootScale || gaussian.transform.localPosition != gaussianBefore)
+                throw new InvalidOperationException("Sitting moved the Avatar root or Gaussian object instead of only the pelvis.");
+            record.passed = true;
+            report = "Actual SMPL-X sitting passed: hips forward, knees bent, arms lowered, floor error=" +
+                Mathf.Abs(record.sittingFloorY - record.standingFloorY).ToString("G5") +
+                " m, pelvis lowering=" + record.pelvisLowering.ToString("F3") + " m, hip height=" + record.sittingHipHeight.ToString("F3") +
+                " m, exact No Pose vertex error=" + record.restoredVertexError.ToString("G5") +
+                " m; custom pose and root unchanged. Geometry: Logs/sitting-pose-validation.json";
+            return true;
+        }
+        catch (Exception error)
+        {
+            report = "Sitting validation failed: " + error.Message;
+            return false;
+        }
+        finally
+        {
+            record.report = report;
+            Directory.CreateDirectory("Logs");
+            File.WriteAllText("Logs/sitting-pose-validation.json", JsonUtility.ToJson(record, false));
+            if (fixture != null)
+            {
+                fixture.ClearSittingPoseState();
+                if (fixture.bakedMesh != null) DestroyImmediate(fixture.bakedMesh);
+                fixture.bakedMesh = null;
+            }
+            if (renderer != null && renderer.sharedMesh != null && renderer.sharedMesh != sourceMesh && renderer.sharedMesh != copiedMesh)
+                DestroyImmediate(renderer.sharedMesh);
+            if (copiedMesh != null) DestroyImmediate(copiedMesh);
+            if (root != null) DestroyImmediate(root);
+        }
+    }
+
+    Vector3 ValidationJoint(int index) => QuestAvatarShoulderTouch.MapMeshWorldPointToGaussianWorld(
+        smr.transform, transform, joints[index].position);
+    Vector3[] ValidationVisibleVertices()
+    {
+        smr.BakeMesh(bakedMesh);
+        Vector3[] vertices = bakedMesh.vertices;
+        for (int i = 0; i < vertices.Length; ++i) vertices[i] = transform.TransformPoint(vertices[i]);
+        return vertices;
+    }
+    static float ValidationFloor(Vector3[] vertices)
+    {
+        float lowest = float.PositiveInfinity;
+        foreach (Vector3 vertex in vertices) lowest = Mathf.Min(lowest, vertex.y);
+        return lowest;
+    }
+    static Vector3[] ValidationSample(Vector3[] vertices)
+    {
+        var sampled = new Vector3[(vertices.Length + 2) / 3];
+        for (int i = 0; i < sampled.Length; ++i) sampled[i] = vertices[i * 3];
+        return sampled;
+    }
+    static float ValidationMaxError(Vector3[] a, Vector3[] b)
+    {
+        if (a.Length != b.Length) return float.PositiveInfinity;
+        float maximum = 0;
+        for (int i = 0; i < a.Length; ++i) maximum = Mathf.Max(maximum, Vector3.Distance(a[i], b[i]));
+        return maximum;
+    }
+#endif
     void Reset()
     {
         AutoAssignReferences();
@@ -321,6 +648,7 @@ public class PoseController : MonoBehaviour
             BeforeVertexBake?.Invoke(this);
             UpdateVertexBuffer();
             vertexBakeRequested = false;
+            sittingPoseBakePending = false;
         }
     }
 
@@ -351,7 +679,7 @@ public class PoseController : MonoBehaviour
     }
     void InitializeJoints()
     {
-        Transform[] childTransforms = smplx.GetComponentsInChildren<Transform>();
+        Transform[] childTransforms = smplx.GetComponentsInChildren<Transform>(true);
         Dictionary<string, Transform> transformFromName = new Dictionary<string, Transform>();
         foreach (Transform childTransform in childTransforms)
         {
@@ -527,6 +855,7 @@ public class PoseController : MonoBehaviour
 
     public void SetCustomPose(float[] pose)
     {
+        ClearSittingPoseState();
         customPose = pose;
         activeCustomPose = pose;
     }
@@ -606,7 +935,7 @@ public class PoseController : MonoBehaviour
         Debug.Log("Applied pose 1 from Animator.");
     }
 
-    void ApplyStableCustomPose(float[] pose)
+    void ApplyStableCustomPose(float[] pose, bool storeCustomPose = true)
     {
         no_pose = false;
         previousNoPose = false;
@@ -615,7 +944,7 @@ public class PoseController : MonoBehaviour
         StopCustomPoseCoroutine();
         using_custom = true;
         previousUsingCustom = true;
-        customPose = pose;
+        if (storeCustomPose) customPose = pose;
         activeCustomPose = pose;
         SetAnimatorDrivenMode(false);
         DisableAnimatorsForCustomPose();
@@ -691,6 +1020,7 @@ public class PoseController : MonoBehaviour
             return;
         }
 
+        if (isSittingPose && !ReferenceEquals(customPose, sittingPoseValues)) ClearSittingPoseState();
         for (int i = 0; i < joints.Length; i++)
         {
             if (joints[i] == null)
@@ -709,6 +1039,9 @@ public class PoseController : MonoBehaviour
         }
         smplx.UpdatePoseCorrectives();
         smplx.UpdateJointPositions(false);
+        // SMPLX may lock the pelvis height during UpdateJointPositions; apply the
+        // seated compensation afterwards, on every LateUpdate, before vertex bake.
+        ApplySittingPelvisOffset();
     }
 
     void CacheAnimators()
@@ -718,6 +1051,7 @@ public class PoseController : MonoBehaviour
 
     void SetAnimatorDrivenMode(bool animatorDriven)
     {
+        ClearSittingPoseState();
         if (smplxAnimators != null)
         {
             for (int i = 0; i < smplxAnimators.Length; ++i)
@@ -949,6 +1283,7 @@ public class PoseController : MonoBehaviour
 
     void OnDestroy()
     {
+        ClearSittingPoseState();
         // Clean up GPU resources
         if (vertexBuffer != null)
         {

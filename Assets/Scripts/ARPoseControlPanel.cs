@@ -302,7 +302,8 @@ public sealed class ARPoseControlPanel : MonoBehaviour
         if (device.TryGetFeatureValue(CommonUsages.gripButton, out bool gripPressed) && gripPressed)
             return true;
 
-        if (device.TryGetFeatureValue(CommonUsages.primaryButton, out bool primaryPressed) && primaryPressed)
+        // Reserve left X for the chair example.
+        if (node == XRNode.RightHand && device.TryGetFeatureValue(CommonUsages.primaryButton, out bool primaryPressed) && primaryPressed)
             return true;
 
         return false;

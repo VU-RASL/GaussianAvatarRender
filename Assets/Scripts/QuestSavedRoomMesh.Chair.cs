@@ -17,7 +17,7 @@ public sealed partial class QuestSavedRoomMesh
     GameObject chairObject;
     Mesh chairGeometryMesh, chairMarkerMesh, chairBackgroundMesh;
     Material chairGeometryMaterial, chairMarkerMaterial;
-    int[] chairOriginalBackgroundIndices, chairSourceVertexIndices;
+    int[] chairOriginalBackgroundIndices, chairSegmentedBackgroundIndices, chairSourceVertexIndices;
     Vector3 chairInitialPosition;
     Quaternion chairInitialRotation;
     Coroutine chairStatusCoroutine;
@@ -100,12 +100,14 @@ public sealed partial class QuestSavedRoomMesh
             var marker = new GameObject("Bounds and +Z front direction"); marker.layer = preview.layer;
             marker.transform.SetParent(stagedObject.transform, false); AddChairRenderer(marker, stagedMarker, stagedMarkerMaterial);
             backgroundChanged = true;
-            mesh.SetIndices(backgroundEdges, MeshTopology.Lines, 0); mesh.RecalculateBounds();
+            // Keep every saved triangle blue until the explicit A reveal.
+            mesh.SetIndices(chairSegmentationRevealed ? backgroundEdges : originalIndices, MeshTopology.Lines, 0); mesh.RecalculateBounds();
             stagedObject.SetActive(true);
             chairObject = stagedObject; chairGeometryMesh = stagedGeometry; chairMarkerMesh = stagedMarker;
             chairGeometryMaterial = stagedMaterial; chairMarkerMaterial = stagedMarkerMaterial;
             chairRoomTransform = preview.transform; chairBackgroundMesh = mesh;
-            chairOriginalBackgroundIndices = originalIndices; chairSourceVertexIndices = sourceIndices.ToArray();
+            chairOriginalBackgroundIndices = originalIndices; chairSegmentedBackgroundIndices = backgroundEdges;
+            chairSourceVertexIndices = sourceIndices.ToArray();
             chairInitialPosition = definition.initialPositionMesh; chairInitialRotation = definition.initialRotationMesh;
             chairPoseSource = "static_user_annotated_baseline";
             SetChairReferenceState("initialized", "User-identified static chair reference loaded. Heading is " + (definition.orientationConfirmed ? "user-confirmed." : "inferred and unconfirmed."));
@@ -123,7 +125,7 @@ public sealed partial class QuestSavedRoomMesh
             DestroyChairOwned(stagedMaterial); DestroyChairOwned(stagedMarkerMaterial);
             chairObject = null; chairRoomTransform = null; chairBackgroundMesh = null;
             chairGeometryMesh = chairMarkerMesh = null; chairGeometryMaterial = chairMarkerMaterial = null;
-            chairOriginalBackgroundIndices = chairSourceVertexIndices = null;
+            chairOriginalBackgroundIndices = chairSegmentedBackgroundIndices = chairSourceVertexIndices = null;
             SetChairReferenceState(error is ChairReferenceMismatch ? "mismatch" : "failure", error.Message);
             return false;
         }
@@ -311,7 +313,7 @@ public sealed partial class QuestSavedRoomMesh
         DestroyChairOwned(chairGeometryMaterial); DestroyChairOwned(chairMarkerMaterial);
         chairObject = null; chairRoomTransform = null; chairBackgroundMesh = null;
         chairGeometryMesh = chairMarkerMesh = null; chairGeometryMaterial = chairMarkerMaterial = null;
-        chairOriginalBackgroundIndices = chairSourceVertexIndices = null; chairReferenceState = "not_initialized";
+        chairOriginalBackgroundIndices = chairSegmentedBackgroundIndices = chairSourceVertexIndices = null; chairReferenceState = "not_initialized";
     }
     static void DestroyChairOwned(UnityEngine.Object item)
     {
@@ -344,6 +346,7 @@ public sealed partial class QuestSavedRoomMesh
             material = new Material(shader) { hideFlags = HideFlags.HideAndDontSave };
             owner = new GameObject("Chair reference editor smoke test") { hideFlags = HideFlags.HideAndDontSave };
             reader = owner.AddComponent<QuestSavedRoomMesh>(); reader.meshMaterial = material;
+            reader.chairSegmentationRevealed = true; // Legacy partition/pose coverage starts after A.
             var preview = new GameObject("Temporary matching saved room") { hideFlags = HideFlags.HideAndDontSave };
             preview.transform.SetParent(owner.transform, false);
             preview.transform.localPosition = new Vector3(1.2f, 0.7f, -2.4f); preview.transform.localRotation = Quaternion.Euler(0f, 37f, 0f);
